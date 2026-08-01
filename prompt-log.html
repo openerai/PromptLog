@@ -421,6 +421,7 @@ async function openLibrary(){
   await scanOrphans();
   // A previous session may have been closed mid-scan.
   if (!processing && db.entries.some(e => e.pending)) processPending();
+  else if (!processing) statBackfill();      // background; move detection needs it
   render();
 }
 
@@ -940,15 +941,59 @@ async function scanOrphans(opts){
   return found.length;
 }
 
+function baseName(p){
+  const s = String(p);
+  return s.slice(s.lastIndexOf("/") + 1).toLowerCase();
+}
+
+/* A file reorganised outside the app looks like "one entry vanished, one
+   appeared". Byte size plus one corroborating signal identifies the pair
+   without reading any content — everything needed comes free from the handle
+   we already open — so tags, notes and favourites follow the file instead of
+   being stranded on a ghost.
+
+   Two signals, because real reorganisation loses different things: dragging a
+   folder keeps the modification time, while a copy-then-delete (and some sync
+   tools) resets it but keeps the name. Either alone is weak; paired with an
+   exact size match and a uniqueness check, both are safe. A size-only match is
+   deliberately NOT accepted, and an ambiguous match is left alone. */
+function findMovedTwin(file, newPath){
+  const sized = db.entries.filter(e => e.missing && e.size === file.size);
+  if (!sized.length) return null;
+  const pick = (list)=> list.length === 1 ? list[0] : null;
+  return pick(sized.filter(e => e.mtime === file.lastModified))
+      || pick(sized.filter(e => baseName(e.filename) === baseName(newPath)));
+}
+
+function adoptMoved(twin, fresh){
+  twin.filename = fresh.filename;
+  delete twin.missing;
+  delete twin.pending;
+  db.entries = db.entries.filter(x => x.id !== fresh.id);
+  cardImgs.delete(fresh.id);
+}
+
 let processing = false;
 async function processPending(list){
   if (processing) return;
   processing = true;
   const queue = (list && list.length) ? list : db.entries.filter(e => e.pending);
-  let done = 0, auto = 0;
+  let done = 0, auto = 0, moved = 0, dirtyView = false;
   for (const e of queue){
     try{
       const file = await getFileAt(e.filename);
+
+      const twin = e.pending ? findMovedTwin(file, e.filename) : null;
+      if (twin){
+        // Same file, new location: keep the original record, and skip the
+        // thumbnail and metadata work because it already has both.
+        adoptMoved(twin, e);
+        moved++; done++; dirtyView = true;
+        continue;
+      }
+
+      e.size = file.size;
+      e.mtime = file.lastModified;
       e.createdAt = new Date(file.lastModified || Date.now()).toISOString();
       try{
         if (applyEmbedded(e, await extractEmbedded(file, e.filename))) auto++;
@@ -966,13 +1011,36 @@ async function processPending(list){
     if (done % 25 === 0){
       setStatus(`${done}/${queue.length} 처리 중...`);
       await saveMeta();
+      if (dirtyView){ render(); dirtyView = false; }   // adopted cards must go
     }
   }
   await saveMeta();
   setStatus("");
   processing = false;
   render();
-  toast(auto ? `처리 완료 · ${auto}개에서 프롬프트를 자동으로 읽었어요.` : "처리 완료.");
+  const parts = [];
+  if (auto) parts.push(`${auto}개에서 프롬프트를 자동으로 읽었어요`);
+  if (moved) parts.push(`${moved}개는 옮겨진 파일로 인식해 기록을 이어붙였어요`);
+  toast(parts.length ? "처리 완료 · " + parts.join(" · ") : "처리 완료.");
+  await statBackfill();
+}
+
+/* Entries created before size/mtime were recorded cannot be matched after a
+   move, so fill them in. getFile() exposes both without reading content. */
+async function statBackfill(){
+  const targets = db.entries.filter(e => !e.pending && !e.missing && e.size == null);
+  if (!targets.length) return;
+  let n = 0;
+  for (const e of targets){
+    try{
+      const file = await getFileAt(e.filename);
+      e.size = file.size;
+      e.mtime = file.lastModified;
+    }catch(err){ /* unreadable: leave it for the next scan */ }
+    if (++n % 200 === 0) setStatus(`파일 정보 정리 중 ${n}/${targets.length}...`);
+  }
+  setStatus("");
+  await saveMeta();
 }
 
 /* Re-reads embedded metadata for entries that are still blank — for a library
@@ -1023,6 +1091,11 @@ async function addFiles(fileList){
       tags:[], seed:"", model:"", notes:"", favorite:false, needInfo:false, thumbFile:"",
       createdAt: new Date().toISOString()
     };
+    try{
+      const written = await fh.getFile();     // the copy we just wrote, not the source
+      entry.size = written.size;
+      entry.mtime = written.lastModified;
+    }catch(e){}
     try{ await writeThumbFile(entry, await makeThumbBlob(file, type)); }catch(e){}
     try{
       if (applyEmbedded(entry, await extractEmbedded(file, name))) autoFilled++;
