@@ -116,7 +116,15 @@ main{padding:8px 28px 60px;}
 }
 .card:hover{transform:translateY(-3px);box-shadow:var(--shadow);border-color:var(--accent);}
 .card .thumb-wrap{position:relative;width:100%;background:var(--bg-elev-2);}
-.card img.thumb{width:100%;display:block;object-fit:cover;}
+.card img.thumb{width:100%;display:block;object-fit:cover;background:var(--bg-elev-2);}
+.card img.thumb:not(.loaded):not(.failed){
+  background:linear-gradient(100deg,var(--bg-elev-2) 30%,var(--border) 50%,var(--bg-elev-2) 70%);
+  background-size:220% 100%;animation:shimmer 1.4s linear infinite;
+}
+.card img.thumb.failed{background:var(--bg-elev-2);}
+@keyframes shimmer{from{background-position:180% 0;}to{background-position:-40% 0;}}
+.card.is-pending{opacity:0.75;}
+.status-label{font-size:12px;color:var(--accent);margin-left:2px;}
 .badge-type{
   position:absolute;top:8px;left:8px;background:rgba(0,0,0,0.55);color:#fff;
   font-size:10.5px;padding:3px 7px;border-radius:6px;display:flex;align-items:center;gap:4px;
@@ -146,6 +154,11 @@ main{padding:8px 28px 60px;}
   padding:3px 8px;border-radius:6px;
 }
 .date-tag{font-size:11px;color:var(--text-faint);margin-left:auto;}
+.folder-tag{
+  font-size:10.5px;color:var(--text-dim);background:var(--bg-elev-2);
+  padding:2px 7px;border-radius:5px;max-width:130px;overflow:hidden;
+  text-overflow:ellipsis;white-space:nowrap;
+}
 .tag-list{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px;}
 .tag-pill{font-size:10.5px;color:var(--text-dim);background:var(--bg-elev-2);padding:2px 7px;border-radius:5px;}
 
@@ -267,6 +280,7 @@ main{padding:8px 28px 60px;}
       <option value="fav">즐겨찾기 우선</option>
     </select>
     <span style="font-size:12px;color:var(--text-faint);margin-left:4px;" id="countLabel"></span>
+    <span class="status-label" id="statusLabel"></span>
   </div>
   <div class="chipbar" id="toolChipBar"></div>
   <div class="chipbar" id="tagChipBar"></div>
@@ -402,7 +416,11 @@ async function openLibrary(){
   document.getElementById("folderName").textContent = rootHandle.name;
   show("appView");
   if (!await loadMeta()) return;   // corrupt metadata: stop before touching anything
+  render();
+  await migrateInlineThumbs();
   await scanOrphans();
+  // A previous session may have been closed mid-scan.
+  if (!processing && db.entries.some(e => e.pending)) processPending();
   render();
 }
 
@@ -747,88 +765,233 @@ function applyEmbedded(entry, meta){
 
 const OWN_FILE_RE = /^metadata(\.json(\.tmp)?|\.backup\.json|\.corrupt-.*\.json)$/i;
 
-async function scanOrphans(opts){
-  opts = opts || {};
-  const known = new Set(db.entries.map(e=>e.filename));
-  const found = [];
-  for await (const [name, handle] of rootHandle.entries()){
-    if (handle.kind === "file" && MEDIA_RE.test(name) && !OWN_FILE_RE.test(name) && !known.has(name)){
-      found.push(name);
+/* =======================================================================
+   Paths
+   entry.filename is a POSIX-style path relative to the chosen folder, so
+   generators that write into dated subfolders (ComfyUI's usual layout) are
+   picked up. Bare names from older libraries keep resolving at the root.
+   ======================================================================= */
+const THUMB_DIR = ".thumbs";
+
+function splitPath(p){ return String(p).split("/").filter(Boolean); }
+
+async function resolveDir(parts, opts){
+  let dir = rootHandle;
+  for (const seg of parts) dir = await dir.getDirectoryHandle(seg, opts);
+  return dir;
+}
+async function fileHandleAt(relPath, opts){
+  const parts = splitPath(relPath);
+  const name = parts.pop();
+  const dir = await resolveDir(parts, opts);
+  return dir.getFileHandle(name, opts);
+}
+async function getFileAt(relPath){ return (await fileHandleAt(relPath)).getFile(); }
+async function removeFileAt(relPath){
+  const parts = splitPath(relPath);
+  const name = parts.pop();
+  return (await resolveDir(parts)).removeEntry(name);
+}
+
+/* ---------- thumbnails (stored as files, not inside metadata.json) ---------- */
+async function thumbsDir(create){
+  return rootHandle.getDirectoryHandle(THUMB_DIR, {create: !!create});
+}
+async function writeThumbFile(entry, thumb){
+  const dir = await thumbsDir(true);
+  const name = entry.id + ".jpg";
+  const fh = await dir.getFileHandle(name, {create:true});
+  const w = await fh.createWritable();
+  await w.write(thumb.blob);
+  await w.close();
+  entry.thumbFile = name;
+  entry.tw = thumb.w; entry.th = thumb.h;
+  delete entry.thumb;                       // drop any inline copy
+}
+async function readThumbFile(entry){
+  if (!entry.thumbFile) return null;
+  const dir = await thumbsDir(false);
+  return (await dir.getFileHandle(entry.thumbFile)).getFile();
+}
+async function removeThumbFile(entry){
+  if (!entry.thumbFile) return;
+  try{ (await thumbsDir(false)).removeEntry(entry.thumbFile); }catch(e){}
+}
+
+function makeCanvas(w, h){
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  return c;
+}
+/* Note: JPEG encoding is throttled to roughly one call per second while the
+   tab is hidden — OffscreenCanvas.convertToBlob() was measured to be no
+   different — so a large first import wants the tab left in the foreground. */
+function canvasToBlob(canvas, quality){
+  return new Promise(res => canvas.toBlob(res, "image/jpeg", quality));
+}
+
+/* Returns {blob, w, h} — the dimensions let cards reserve space before the
+   thumbnail arrives, which keeps the masonry from reflowing while scrolling. */
+async function makeThumbBlob(file, type){
+  const targetW = 420;
+  if (type === "image"){
+    const bmp = await createImageBitmap(file, {resizeWidth: targetW, resizeQuality:"high"});
+    const canvas = makeCanvas(bmp.width, bmp.height);
+    canvas.getContext("2d").drawImage(bmp,0,0);
+    bmp.close();
+    return {blob: await canvasToBlob(canvas, 0.78), w: canvas.width, h: canvas.height};
+  }
+  const url = URL.createObjectURL(file);
+  try{
+    const video = document.createElement("video");
+    video.src = url; video.muted = true; video.playsInline = true;
+    await new Promise((res,rej)=>{
+      const timer = setTimeout(()=>rej(new Error("timeout")), 8000);
+      const done = ()=>{ clearTimeout(timer); res(); };
+      video.onloadeddata = ()=>{ video.currentTime = Math.min(0.3, (video.duration||1)/4); };
+      video.onseeked = done;
+      video.onerror = ()=>{ clearTimeout(timer); rej(new Error("decode")); };
+    });
+    const ratio = video.videoHeight / video.videoWidth || 0.6;
+    const canvas = makeCanvas(targetW, Math.round(targetW*ratio));
+    canvas.getContext("2d").drawImage(video,0,0,canvas.width,canvas.height);
+    return {blob: await canvasToBlob(canvas, 0.75), w: canvas.width, h: canvas.height};
+  } finally { URL.revokeObjectURL(url); }
+}
+
+/* Libraries created before thumbnails were files carry base64 in metadata.json;
+   move them out so the JSON stops growing with the gallery. */
+async function migrateInlineThumbs(){
+  const inline = db.entries.filter(e => e.thumb && !e.thumbFile);
+  if (!inline.length) return;
+  setStatus(`썸네일 ${inline.length}개를 파일로 옮기는 중...`);
+  let moved = 0;
+  for (const e of inline){
+    try{
+      const blob = await (await fetch(e.thumb)).blob();
+      await writeThumbFile(e, {blob, w:0, h:0});
+      moved++;
+    }catch(err){ /* leave it inline rather than lose the thumbnail */ }
+  }
+  if (moved) await saveMeta();
+  setStatus("");
+  if (moved) toast(`썸네일 ${moved}개를 ${THUMB_DIR} 폴더로 옮겼어요.`);
+}
+
+/* ---------- scanning ---------- */
+const MAX_DEPTH = 8;
+
+async function walkMedia(dir, prefix, depth, out, onProgress){
+  if (depth > MAX_DEPTH) return;
+  for await (const [name, handle] of dir.entries()){
+    if (handle.kind === "directory"){
+      if (name.startsWith(".")) continue;          // .thumbs and other hidden dirs
+      await walkMedia(handle, prefix + name + "/", depth + 1, out, onProgress);
+    } else if (MEDIA_RE.test(name) && !OWN_FILE_RE.test(name)){
+      out.push(prefix + name);
+      if (onProgress && out.length % 500 === 0) onProgress(out.length);
     }
   }
+}
+
+/* Two phases on purpose: registering the files is a directory listing and
+   finishes at once, while thumbnails and metadata need to open every file.
+   The gallery becomes usable after phase 1 instead of after the slow part. */
+async function scanOrphans(opts){
+  opts = opts || {};
+  const known = new Set(db.entries.map(e => e.filename));
+  const all = [];
+  setStatus("폴더를 훑는 중...");
+  await walkMedia(rootHandle, "", 0, all, n => setStatus(`파일 ${n}개 확인 중...`));
+  setStatus("");
+
+  // The walk already knows everything that exists, so flag entries whose file
+  // was moved or deleted outside the app instead of leaving them loading forever.
+  const present = new Set(all);
+  let vanished = 0, restored = 0;
+  db.entries.forEach(e=>{
+    if (e.pending) return;
+    if (present.has(e.filename)){
+      if (e.missing){ delete e.missing; restored++; }
+    } else if (!e.missing){
+      e.missing = true; vanished++;
+    }
+  });
+
+  const found = all.filter(p => !known.has(p));
   if (!found.length){
-    if (opts.manual) toast("새로 추가된 파일이 없어요.");
+    if (vanished || restored) await saveMeta();
+    if (vanished) toast(`파일 ${vanished}개가 폴더에서 사라졌어요. 항목은 남겨뒀습니다.`);
+    else if (opts.manual) toast("새로 추가된 파일이 없어요.");
+    if (vanished || restored) render();
     return 0;
   }
-  if (opts.manual) toast(`${found.length}개를 읽는 중...`);
-  let auto = 0;
-  for (const name of found){
-    const fh = await rootHandle.getFileHandle(name);
-    const file = await fh.getFile();
-    const type = VIDEO_RE.test(name) ? "video" : "image";
-    let thumb = "";
-    try{ thumb = await makeThumb(file, type); }catch(e){}
-    const entry = {
-      id: crypto.randomUUID(), filename:name, type, prompt:"", negative:"", tool:"", tags:[],
-      seed:"", model:"", notes:"", favorite:false, needInfo:true, thumb,
-      createdAt: new Date(file.lastModified || Date.now()).toISOString()
-    };
+  const fresh = found.map(p => ({
+    id: crypto.randomUUID(), filename: p, type: VIDEO_RE.test(p) ? "video" : "image",
+    prompt:"", negative:"", tool:"", tags:[], seed:"", model:"", notes:"",
+    favorite:false, needInfo:true, thumbFile:"", pending:true,
+    createdAt: new Date().toISOString()
+  }));
+  fresh.forEach(e => db.entries.unshift(e));
+  await saveMeta();
+  render();
+  toast(`새 파일 ${found.length}개를 찾았어요. 이어서 읽는 중...`);
+  processPending(fresh);          // intentionally not awaited
+  return found.length;
+}
+
+let processing = false;
+async function processPending(list){
+  if (processing) return;
+  processing = true;
+  const queue = (list && list.length) ? list : db.entries.filter(e => e.pending);
+  let done = 0, auto = 0;
+  for (const e of queue){
     try{
-      if (applyEmbedded(entry, await extractEmbedded(file, name))) auto++;
-    }catch(e){ console.warn("meta extract failed", name, e); }
-    db.entries.unshift(entry);
+      const file = await getFileAt(e.filename);
+      e.createdAt = new Date(file.lastModified || Date.now()).toISOString();
+      try{
+        if (applyEmbedded(e, await extractEmbedded(file, e.filename))) auto++;
+      }catch(err){ console.warn("meta extract failed", e.filename, err); }
+      try{
+        await writeThumbFile(e, await makeThumbBlob(file, e.type));
+      }catch(err){ console.warn("thumb failed", e.filename, err); }
+      delete e.missing;
+    }catch(err){
+      e.missing = true;                       // file vanished mid-scan
+    }
+    delete e.pending;
+    refreshCard(e);
+    done++;
+    if (done % 25 === 0){
+      setStatus(`${done}/${queue.length} 처리 중...`);
+      await saveMeta();
+    }
   }
   await saveMeta();
-  toast(auto
-    ? `새 파일 ${found.length}개 · 그중 ${auto}개는 프롬프트를 자동으로 읽었어요.`
-    : `새 파일 ${found.length}개를 찾았어요. 정보를 채워주세요.`);
-  return found.length;
+  setStatus("");
+  processing = false;
+  render();
+  toast(auto ? `처리 완료 · ${auto}개에서 프롬프트를 자동으로 읽었어요.` : "처리 완료.");
 }
 
 /* Re-reads embedded metadata for entries that are still blank — for a library
    that was imported before extraction existed. */
 async function backfillMeta(){
-  const targets = db.entries.filter(e => !e.autoMeta && !e.prompt && /\.png$/i.test(e.filename));
+  const targets = db.entries.filter(e => !e.autoMeta && !e.prompt && !e.pending && /\.png$/i.test(e.filename));
   if (!targets.length){ toast("자동 추출할 항목이 없어요."); return; }
-  toast(`${targets.length}개를 다시 읽는 중...`);
-  let filled = 0;
+  let filled = 0, n = 0;
   for (const e of targets){
     try{
-      const file = await (await rootHandle.getFileHandle(e.filename)).getFile();
+      const file = await getFileAt(e.filename);
       if (applyEmbedded(e, await extractEmbedded(file, e.filename))) filled++;
     }catch(err){ /* file gone or unreadable: leave the entry alone */ }
+    if (++n % 25 === 0) setStatus(`${n}/${targets.length} 다시 읽는 중...`);
   }
+  setStatus("");
   await saveMeta();
   render();
   toast(`${filled}개에서 프롬프트를 찾았어요.`);
-}
-
-/* ---------- thumbnails ---------- */
-async function makeThumb(file, type){
-  const targetW = 420;
-  if (type === "image"){
-    const bmp = await createImageBitmap(file, {resizeWidth: targetW, resizeQuality:"high"});
-    const canvas = document.createElement("canvas");
-    canvas.width = bmp.width; canvas.height = bmp.height;
-    canvas.getContext("2d").drawImage(bmp,0,0);
-    return canvas.toDataURL("image/jpeg", 0.78);
-  } else {
-    const url = URL.createObjectURL(file);
-    try{
-      const video = document.createElement("video");
-      video.src = url; video.muted = true; video.playsInline = true;
-      await new Promise((res,rej)=>{
-        video.onloadeddata = ()=>{ video.currentTime = Math.min(0.3, (video.duration||1)/4); };
-        video.onseeked = res; video.onerror = rej;
-        setTimeout(rej, 8000);
-      });
-      const ratio = video.videoHeight / video.videoWidth || 0.6;
-      const canvas = document.createElement("canvas");
-      canvas.width = targetW; canvas.height = Math.round(targetW*ratio);
-      canvas.getContext("2d").drawImage(video,0,0,canvas.width,canvas.height);
-      return canvas.toDataURL("image/jpeg", 0.75);
-    } finally { URL.revokeObjectURL(url); }
-  }
 }
 
 /* ---------- adding files ---------- */
@@ -855,13 +1018,12 @@ async function addFiles(fileList){
     await w.write(file);
     await w.close();
     const type = VIDEO_RE.test(name) ? "video" : "image";
-    let thumb = "";
-    try{ thumb = await makeThumb(file, type); }catch(e){}
     const entry = {
       id: crypto.randomUUID(), filename:name, type, prompt:"", negative:"", tool:"",
-      tags:[], seed:"", model:"", notes:"", favorite:false, needInfo:false, thumb,
+      tags:[], seed:"", model:"", notes:"", favorite:false, needInfo:false, thumbFile:"",
       createdAt: new Date().toISOString()
     };
+    try{ await writeThumbFile(entry, await makeThumbBlob(file, type)); }catch(e){}
     try{
       if (applyEmbedded(entry, await extractEmbedded(file, name))) autoFilled++;
     }catch(e){ console.warn("meta extract failed", name, e); }
@@ -917,10 +1079,89 @@ function filtered(){
   return list;
 }
 
+/* Thumbnails are files now, so each visible card fetches its own. The observer
+   keeps that to what is actually on screen; revoking in onload is safe because
+   a decoded image survives its object URL. */
+let thumbObserver = null;
+const cardImgs = new Map();      // entry id -> <img>, so one card can be refreshed alone
+
+function observeThumb(img, entry){
+  if (!thumbObserver){
+    thumbObserver = new IntersectionObserver((rows)=>{
+      rows.forEach(row=>{
+        if (!row.isIntersecting) return;
+        thumbObserver.unobserve(row.target);
+        loadThumb(row.target);
+      });
+    }, {rootMargin: "600px"});
+  }
+  img._entry = entry;
+  thumbObserver.observe(img);
+}
+
+async function loadThumb(img){
+  const entry = img._entry;
+  if (!entry || !entry.thumbFile || img.dataset.loading) return;
+  img.dataset.loading = "1";
+  try{
+    const file = await readThumbFile(entry);
+    if (!file || !img.isConnected) return;
+    const url = URL.createObjectURL(file);
+    img.onload = img.onerror = ()=> URL.revokeObjectURL(url);
+    img.src = url;
+    img.classList.add("loaded");
+  }catch(e){
+    // Stop the shimmer: an endless placeholder reads as "still loading".
+    img.classList.add("failed");
+  }
+}
+
+/* The observer only runs while the page is actually being rendered, so a
+   backgrounded or non-compositing tab would show nothing but placeholders.
+   This fills the first screens synchronously and never leaves the gallery blank. */
+function primeThumbs(){
+  const ahead = window.innerHeight + 800;
+  cardImgs.forEach(img=>{
+    if (img.classList.contains("loaded") || img.dataset.loading) return;
+    const r = img.getBoundingClientRect();
+    if (r.top < ahead && r.bottom > -800) loadThumb(img);
+  });
+}
+document.addEventListener("visibilitychange", ()=>{ if (!document.hidden) primeThumbs(); });
+window.addEventListener("focus", primeThumbs);
+
+/* Repaint a single card after the background pass fills it in. */
+function refreshCard(entry){
+  const img = cardImgs.get(entry.id);
+  if (!img) return;
+  const wrap = img.closest(".card");
+  if (!wrap) return;
+  if (entry.tw && entry.th) img.style.aspectRatio = `${entry.tw} / ${entry.th}`;
+  wrap.classList.toggle("is-pending", !!entry.pending);
+  if (entry.thumbFile && !img.classList.contains("loaded")) loadThumb(img);
+  const p = wrap.querySelector(".card-prompt");
+  if (p && entry.prompt){ p.textContent = entry.prompt; p.classList.remove("empty"); }
+  const badges = wrap.querySelector(".thumb-wrap");
+  if (badges && entry.autoMeta && !badges.querySelector(".badge-auto")){
+    const need = badges.querySelector(".badge-need");
+    if (need) need.remove();
+    const ab = document.createElement("div");
+    ab.className = "badge-auto"; ab.textContent = "AUTO";
+    badges.appendChild(ab);
+  }
+}
+
+function setStatus(msg){
+  const el = document.getElementById("statusLabel");
+  if (el) el.textContent = msg || "";
+}
+
 function render(){
   const list = filtered();
   document.getElementById("countLabel").textContent = `${list.length}개`;
   const grid = document.getElementById("grid");
+  if (thumbObserver) thumbObserver.disconnect();
+  cardImgs.clear();
   grid.innerHTML = "";
   document.getElementById("emptyState").style.display = db.entries.length ? "none" : "";
 
@@ -929,19 +1170,27 @@ function render(){
   const frag = document.createDocumentFragment();
   list.forEach(e=>{
     const card = document.createElement("div");
-    card.className = "card";
+    card.className = "card" + (e.pending ? " is-pending" : "");
     card.onclick = ()=> openEditModal(e.id);
     const thumbWrap = document.createElement("div");
     thumbWrap.className = "thumb-wrap";
     const img = document.createElement("img");
-    img.className = "thumb"; img.loading = "lazy";
-    img.src = e.thumb || "";
+    img.className = "thumb";
+    // Reserve the right box before the file loads so the masonry stops jumping.
+    img.style.aspectRatio = (e.tw && e.th) ? `${e.tw} / ${e.th}` : "1 / 1";
+    if (e.thumb){ img.src = e.thumb; img.classList.add("loaded"); }   // not migrated yet
+    else observeThumb(img, e);
+    cardImgs.set(e.id, img);
     thumbWrap.appendChild(img);
     const typeBadge = document.createElement("div");
     typeBadge.className = "badge-type";
     typeBadge.textContent = e.type === "video" ? "▶ 영상" : "🖼 이미지";
     thumbWrap.appendChild(typeBadge);
-    if (e.needInfo){
+    if (e.missing){
+      const mb = document.createElement("div");
+      mb.className = "badge-need"; mb.textContent = "파일 없음";
+      thumbWrap.appendChild(mb);
+    } else if (e.needInfo){
       const nb = document.createElement("div");
       nb.className = "badge-need"; nb.textContent = "정보 필요";
       thumbWrap.appendChild(nb);
@@ -966,6 +1215,13 @@ function render(){
     const meta = document.createElement("div");
     meta.className = "card-meta";
     if (e.tool){ const tt = document.createElement("span"); tt.className="tool-tag"; tt.textContent=e.tool; meta.appendChild(tt); }
+    const slash = e.filename.lastIndexOf("/");
+    if (slash > 0){
+      const fold = document.createElement("span");
+      fold.className = "folder-tag"; fold.textContent = "📁 " + e.filename.slice(0, slash);
+      fold.title = e.filename;
+      meta.appendChild(fold);
+    }
     const dt = document.createElement("span"); dt.className="date-tag";
     dt.textContent = new Date(e.createdAt).toLocaleDateString("ko-KR",{year:"2-digit",month:"2-digit",day:"2-digit"});
     meta.appendChild(dt);
@@ -979,6 +1235,7 @@ function render(){
     frag.appendChild(card);
   });
   grid.appendChild(frag);
+  primeThumbs();
 }
 
 function renderChips(){
@@ -1063,8 +1320,7 @@ async function openEditModal(id, opts){
   const mediaPane = wrap.querySelector(".media-pane");
   mediaPane.innerHTML = `<div class="spinner"></div>`;
   try{
-    const fh = await rootHandle.getFileHandle(entry.filename);
-    const file = await fh.getFile();
+    const file = await getFileAt(entry.filename);
     const url = URL.createObjectURL(file);
     modalUrls.push(url);
     mediaPane.innerHTML = "";
@@ -1108,8 +1364,9 @@ async function openEditModal(id, opts){
   };
 
   wrap.querySelector("[data-delete]").onclick = async ()=>{
-    if (!confirm("이 항목을 목록에서 삭제할까요? (원본 파일도 함께 삭제됩니다)")) return;
-    try{ await rootHandle.removeEntry(entry.filename); }catch(e){}
+    if (!confirm(`이 항목을 삭제할까요?\n원본 파일도 함께 삭제됩니다:\n${entry.filename}`)) return;
+    try{ await removeFileAt(entry.filename); }catch(e){}
+    await removeThumbFile(entry);
     db.entries = db.entries.filter(x=>x.id!==entry.id);
     await saveMeta();
     closeModal();
@@ -1192,27 +1449,36 @@ document.getElementById("exportBtn").onclick = async ()=>{
   const list = filtered();
   if (!list.length){ toast("내보낼 항목이 없어요."); return; }
   const includeFull = confirm(`${list.length}개 항목을 내보냅니다.\n원본 파일까지 포함할까요? (용량이 커질 수 있어요)\n\n확인 = 원본 포함 / 취소 = 썸네일만`);
-  toast("내보내는 중...");
+  const toDataUrl = (file)=> new Promise((res,rej)=>{
+    const r = new FileReader();
+    r.onload = ()=>res(r.result); r.onerror = rej;
+    r.readAsDataURL(file);
+  });
   const items = [];
+  let n = 0;
   for (const e of list){
-    let mediaSrc = e.thumb;
+    // Thumbnails live on disk now, so the export has to inline them itself.
+    let mediaSrc = e.thumb || "";
     let isFull = false;
+    if (!mediaSrc){
+      try{
+        const t = await readThumbFile(e);
+        if (t) mediaSrc = await toDataUrl(t);
+      }catch(err){}
+    }
     if (includeFull){
       try{
-        const fh = await rootHandle.getFileHandle(e.filename);
-        const file = await fh.getFile();
+        const file = await getFileAt(e.filename);
         if (file.size < 20*1024*1024){
-          mediaSrc = await new Promise((res,rej)=>{
-            const r = new FileReader();
-            r.onload = ()=>res(r.result); r.onerror=rej;
-            r.readAsDataURL(file);
-          });
+          mediaSrc = await toDataUrl(file);
           isFull = true;
         }
       }catch(err){}
     }
     items.push({e, mediaSrc, isFull});
+    if (++n % 20 === 0) setStatus(`내보내는 중 ${n}/${list.length}...`);
   }
+  setStatus("");
   const html = buildExportHtml(items);
   const blob = new Blob([html], {type:"text/html"});
   const a = document.createElement("a");
