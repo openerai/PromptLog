@@ -191,6 +191,16 @@ main{padding:8px 28px 60px;}
   background:rgba(0,0,0,0.4);border:none;color:#fff;display:flex;align-items:center;justify-content:center;z-index:2;
 }
 .filename-note{font-size:11px;color:var(--text-faint);}
+.param-box{border:1px solid var(--border);border-radius:9px;padding:9px 11px;background:var(--bg-elev-2);}
+.param-head{font-size:10.5px;text-transform:uppercase;letter-spacing:0.3px;color:var(--text-faint);font-weight:700;margin-bottom:7px;}
+.param-list{display:flex;flex-wrap:wrap;gap:5px;}
+.param-chip{font-size:11px;color:var(--text-dim);background:var(--bg-elev);border:1px solid var(--border);padding:2px 7px;border-radius:5px;}
+.param-chip b{color:var(--text-faint);font-weight:600;margin-right:3px;}
+.badge-auto{
+  position:absolute;top:8px;right:8px;background:var(--accent-soft);color:var(--accent);
+  border:1px solid var(--accent);font-size:10px;font-weight:700;padding:2px 6px;border-radius:6px;
+  backdrop-filter:blur(2px);
+}
 .toast{
   position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
   background:var(--bg-elev-2);border:1px solid var(--border);color:var(--text);
@@ -227,11 +237,20 @@ main{padding:8px 28px 60px;}
   <button class="btn small" id="reconnectPickOther">다른 폴더 선택</button>
 </div>
 
+<div id="fatalView" class="gate" style="display:none;">
+  <h2 style="color:var(--danger);">메타데이터를 읽을 수 없어요</h2>
+  <p id="fatalDetail"></p>
+  <p style="font-size:12.5px;">데이터를 덮어쓰지 않기 위해 여기서 멈췄습니다. 파일을 고친 뒤 새로고침해주세요.</p>
+  <button class="btn small" id="fatalPickOther">다른 폴더 선택</button>
+</div>
+
 <div id="appView" style="display:none;">
 <header>
   <div class="header-top">
     <div class="brand"><h1>Prompt Log<span class="dot">.</span></h1></div>
     <div class="folder-chip">📁 <strong id="folderName"></strong></div>
+    <button class="btn small" id="rescanBtn" title="폴더에 새로 생긴 파일 읽기">↻ 새로고침</button>
+    <button class="btn small" id="backfillBtn" title="비어 있는 항목에서 PNG에 박힌 프롬프트 다시 추출">✨ 자동 추출</button>
     <button class="btn small" id="switchFolderBtn">폴더 변경</button>
     <button class="btn icon small" id="themeBtn" title="테마 전환">🌙</button>
     <button class="btn small" id="exportBtn">⤓ 내보내기</button>
@@ -272,12 +291,15 @@ main{padding:8px 28px 60px;}
     <div class="form-pane">
       <h3>항목 정보</h3>
       <div class="field"><label>프롬프트</label><textarea data-f="prompt" placeholder="이 결과물을 만든 프롬프트를 입력하세요"></textarea></div>
+      <div class="field"><label>네거티브 프롬프트</label><textarea data-f="negative" style="min-height:52px;" placeholder="선택"></textarea></div>
       <div class="row2">
-        <div class="field"><label>툴 / 모델</label><input list="toolList" data-f="tool" placeholder="예: ComfyUI, Seedance, Midjourney"></div>
+        <div class="field"><label>툴</label><input list="toolList" data-f="tool" placeholder="예: ComfyUI, Seedance, Midjourney"></div>
         <div class="field"><label>시드</label><input data-f="seed" placeholder="선택"></div>
       </div>
+      <div class="field"><label>모델 / 체크포인트</label><input data-f="model" placeholder="선택"></div>
       <div class="field"><label>태그 (쉼표로 구분)</label><input data-f="tagsRaw" placeholder="예: 인물, 실사, 야간"></div>
       <div class="field"><label>메모</label><textarea data-f="notes" style="min-height:60px;" placeholder="선택"></textarea></div>
+      <div data-params></div>
       <div class="filename-note" data-fn></div>
       <div class="modal-actions">
         <button class="btn primary" data-save>저장</button>
@@ -298,7 +320,7 @@ main{padding:8px 28px 60px;}
 let rootHandle = null;
 let db = {version:1, entries:[]};
 let state = {search:"", tool:null, tag:null, sort:"new", needOnly:false};
-let objectUrls = [];
+let modalUrls = [];   // object URLs owned by the open modal; revoked on close
 
 /* ---------- idb for handle persistence ---------- */
 function idbOpen(){
@@ -332,7 +354,7 @@ function toast(msg){
   clearTimeout(toast._t);
   toast._t = setTimeout(()=>t.classList.remove("show"), 2200);
 }
-function show(id){ ["gateView","reconnectView","appView"].forEach(v=>{document.getElementById(v).style.display = v===id?"":"none";}); }
+function show(id){ ["gateView","reconnectView","fatalView","appView"].forEach(v=>{document.getElementById(v).style.display = v===id?"":"none";}); }
 
 /* ---------- boot ---------- */
 async function boot(){
@@ -359,6 +381,7 @@ async function boot(){
 
 document.getElementById("pickFolderBtn").onclick = pickFolder;
 document.getElementById("reconnectPickOther").onclick = pickFolder;
+document.getElementById("fatalPickOther").onclick = pickFolder;
 document.getElementById("switchFolderBtn").onclick = pickFolder;
 document.getElementById("reconnectBtn").onclick = async ()=>{
   const perm = await rootHandle.requestPermission({mode:"readwrite"});
@@ -378,55 +401,406 @@ async function pickFolder(){
 async function openLibrary(){
   document.getElementById("folderName").textContent = rootHandle.name;
   show("appView");
-  await loadMeta();
+  if (!await loadMeta()) return;   // corrupt metadata: stop before touching anything
   await scanOrphans();
   render();
 }
 
 /* ---------- metadata io ---------- */
+const META_FILE = "metadata.json";
+const TMP_FILE  = "metadata.json.tmp";
+const BAK_FILE  = "metadata.backup.json";
+
+/* A parse failure must never destroy the file. We quarantine it under a dated
+   name, hand the user the filename, and refuse to run rather than start empty. */
 async function loadMeta(){
+  let text = null;
   try{
-    const fh = await rootHandle.getFileHandle("metadata.json");
-    const text = await (await fh.getFile()).text();
-    db = text.trim() ? JSON.parse(text) : {version:1, entries:[]};
+    const fh = await rootHandle.getFileHandle(META_FILE);
+    text = await (await fh.getFile()).text();
   }catch(e){
-    db = {version:1, entries:[]};
+    db = {version:1, entries:[]};        // genuinely absent: first run
     await saveMeta();
+    return true;
+  }
+  if (!text.trim()){ db = {version:1, entries:[]}; return true; }
+  try{
+    const parsed = JSON.parse(text);
+    if (!parsed || !Array.isArray(parsed.entries)) throw new Error("shape");
+    db = parsed;
+  }catch(e){
+    const stamp = new Date().toISOString().replace(/[:.]/g,"-").slice(0,19);
+    const quarantine = `metadata.corrupt-${stamp}.json`;
+    try{
+      const q = await rootHandle.getFileHandle(quarantine, {create:true});
+      const w = await q.createWritable();
+      await w.write(text); await w.close();
+    }catch(err){ console.error("quarantine failed", err); }
+    showFatal(quarantine);
+    return false;
+  }
+  await writeBackupOnce(text);
+  return true;
+}
+
+/* One snapshot of the last known-good file per session — cheap insurance
+   that costs a single write instead of doubling every save. */
+let backupDone = false;
+async function writeBackupOnce(text){
+  if (backupDone || !text) return;
+  backupDone = true;
+  try{
+    const fh = await rootHandle.getFileHandle(BAK_FILE, {create:true});
+    const w = await fh.createWritable();
+    await w.write(text); await w.close();
+  }catch(e){ console.warn("backup failed", e); }
+}
+
+/* Saves are fired from many handlers; serialise them so two writers can never
+   interleave into the same file, and stage through a temp file so a crash
+   mid-write leaves the previous metadata.json intact. */
+let saveChain = Promise.resolve();
+function saveMeta(){
+  saveChain = saveChain.then(doSaveMeta, doSaveMeta);
+  return saveChain;
+}
+async function doSaveMeta(){
+  const payload = JSON.stringify(db, null, 2);
+  try{
+    const tmp = await rootHandle.getFileHandle(TMP_FILE, {create:true});
+    const w = await tmp.createWritable();
+    await w.write(payload);
+    await w.close();
+    if (typeof tmp.move === "function"){
+      await tmp.move(META_FILE);            // atomic swap where supported
+      return;
+    }
+    const fh = await rootHandle.getFileHandle(META_FILE, {create:true});
+    const w2 = await fh.createWritable();
+    await w2.write(payload);
+    await w2.close();
+    try{ await rootHandle.removeEntry(TMP_FILE); }catch(e){}
+  }catch(e){
+    console.error("save failed", e);
+    toast("저장에 실패했어요. 폴더 권한을 확인해주세요.");
+    throw e;
   }
 }
-async function saveMeta(){
-  const fh = await rootHandle.getFileHandle("metadata.json", {create:true});
-  const w = await fh.createWritable();
-  await w.write(JSON.stringify(db, null, 2));
-  await w.close();
+
+function showFatal(quarantineName){
+  const el = document.getElementById("fatalView");
+  document.getElementById("fatalDetail").textContent =
+    `손상된 파일을 ${quarantineName} 으로 백업해두었어요. ` +
+    `metadata.backup.json 이 있다면 그 파일의 이름을 metadata.json 으로 바꾸면 복구됩니다.`;
+  show("fatalView");
 }
 
 const MEDIA_RE = /\.(png|jpe?g|webp|gif|bmp|avif|mp4|webm|mov|m4v)$/i;
 const VIDEO_RE = /\.(mp4|webm|mov|m4v)$/i;
 
-async function scanOrphans(){
+/* =======================================================================
+   Embedded generation metadata
+   ComfyUI writes the full API graph into a PNG tEXt chunk named "prompt"
+   (and the editor graph into "workflow"); A1111 writes a flat text blob
+   into "parameters". Both mean the prompt never has to be typed by hand.
+   ======================================================================= */
+
+const PNG_SIG = [0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A];
+
+/* Chunks live before IDAT, but a workflow blob can be hundreds of KB, so the
+   buffer is grown on demand instead of reading the whole (possibly 4K) file. */
+async function readPngTextChunks(file){
+  let need = Math.min(file.size, 1 << 16);
+  let buf = new Uint8Array(await file.slice(0, need).arrayBuffer());
+  if (buf.length < 8 || PNG_SIG.some((b,i)=> buf[i] !== b)) return null;
+
+  const grow = async (upto)=>{
+    if (need >= file.size) return false;
+    need = Math.min(file.size, Math.max(need * 2, upto));
+    buf = new Uint8Array(await file.slice(0, need).arrayBuffer());
+    return true;
+  };
+  const dec = new TextDecoder("utf-8");
+  const out = {};
+  let i = 8;
+  while (true){
+    if (i + 8 > buf.length && !await grow(i + 8)) break;
+    if (i + 8 > buf.length) break;
+    const dv = new DataView(buf.buffer, buf.byteOffset);
+    const len = dv.getUint32(i);
+    const type = String.fromCharCode(buf[i+4], buf[i+5], buf[i+6], buf[i+7]);
+    if (type === "IDAT" || type === "IEND") break;
+    if (len > 64 * 1024 * 1024) break;                       // refuse absurd chunks
+    if (i + 12 + len > buf.length && !await grow(i + 12 + len)) break;
+    if (i + 12 + len > buf.length) break;
+
+    if (type === "tEXt" || type === "iTXt"){
+      const body = buf.subarray(i + 8, i + 8 + len);
+      let z = body.indexOf(0);
+      if (z > 0){
+        const key = dec.decode(body.subarray(0, z));
+        let valStart = z + 1;
+        if (type === "iTXt"){
+          const compressed = body[valStart] === 1;
+          valStart += 2;                                      // compression flag + method
+          const langEnd = body.indexOf(0, valStart);           // language tag
+          const trEnd = langEnd < 0 ? -1 : body.indexOf(0, langEnd + 1);   // translated keyword
+          if (compressed || langEnd < 0 || trEnd < 0){ i += 12 + len; continue; }
+          valStart = trEnd + 1;
+        }
+        out[key] = dec.decode(body.subarray(valStart));
+      }
+    }
+    i += 12 + len;
+  }
+  return out;
+}
+
+/* Ordered by trustworthiness: a populated wildcard beats its raw template. */
+const TEXT_KEYS = ["populated_text","text","text_g","prompt","positive","string","wildcard_text","value"];
+const SKIP_TEXT_CLASSES = ["showanything","addlabel","note","previewany","markdownnote","display","showtext","debugprint"];
+
+/* Walk back from a conditioning link until a node exposes literal text. */
+function resolveText(graph, ref, depth, seen){
+  depth = depth || 0; seen = seen || new Set();
+  if (depth > 12 || !Array.isArray(ref) || !ref.length) return "";
+  const nid = String(ref[0]);
+  if (seen.has(nid)) return "";
+  seen.add(nid);
+  const node = graph[nid];
+  if (!node) return "";
+  if (String(node.class_type || "").indexOf("ConditioningZeroOut") >= 0) return "";
+  const ins = node.inputs || {};
+  for (const k of TEXT_KEYS){
+    const v = ins[k];
+    if (typeof v === "string" && v.trim()) return v.trim();
+  }
+  // No literal here: gather upstream. Joining rather than first-wins keeps
+  // StringConcatenate-style prompt assembly intact.
+  const parts = [];
+  for (const k in ins){
+    const v = ins[k];
+    if (Array.isArray(v) && v.length === 2){
+      const got = resolveText(graph, v, depth + 1, seen);
+      if (got) parts.push(got);
+    }
+  }
+  return parts.join(" ").trim();
+}
+
+/* Follow a numeric link (seed fed by e.g. a Seed (rgthree) node) to its literal. */
+function resolveScalar(graph, ref, want, depth){
+  depth = depth || 0;
+  if (depth > 6 || !Array.isArray(ref) || !ref.length) return null;
+  const node = graph[String(ref[0])];
+  if (!node) return null;
+  const ins = node.inputs || {};
+  for (const k of [want, "seed", "noise_seed", "value", "int", "number"]){
+    const v = ins[k];
+    if (typeof v === "number" || (typeof v === "string" && v.trim())) return v;
+    if (Array.isArray(v)){
+      const got = resolveScalar(graph, v, want, depth + 1);
+      if (got !== null && got !== undefined) return got;
+    }
+  }
+  return null;
+}
+
+/* Rank every plausible sampler; prefer the ones carrying real conditioning. */
+function pickSampler(graph){
+  let best = null;
+  for (const nid in graph){
+    const n = graph[nid], ins = n.inputs || {};
+    const hasCond = ("positive" in ins) || ("guider" in ins);
+    const hasSeed = ("seed" in ins) || ("noise_seed" in ins) || ("noise" in ins);
+    if (!hasCond && !(hasSeed && ("steps" in ins))) continue;
+    const score = 2*("positive" in ins) + 2*("guider" in ins) + ("steps" in ins) + ("cfg" in ins)
+                + (String(n.class_type||"").indexOf("KSampler") === 0 ? 1 : 0);
+    if (!best || score > best.score) best = {score, node:n};
+  }
+  return best ? best.node : null;
+}
+
+/* No usable sampler chain: fall back to the longest literal prompt string. */
+function fallbackText(graph){
+  let best = "";
+  for (const nid in graph){
+    const n = graph[nid];
+    const ct = String(n.class_type || "").toLowerCase();
+    if (SKIP_TEXT_CLASSES.some(s => ct.indexOf(s) >= 0)) continue;
+    const ins = n.inputs || {};
+    for (const k of TEXT_KEYS){
+      const v = ins[k];
+      if (typeof v === "string" && v.trim().length > 8 && v.length > best.length) best = v.trim();
+    }
+  }
+  return best;
+}
+
+function extractFromComfyGraph(graph){
+  const out = {params:{}};
+  const node = pickSampler(graph);
+  if (node){
+    const ins = node.inputs || {};
+    out.prompt   = resolveText(graph, ins.positive || ins.guider);
+    out.negative = resolveText(graph, ins.negative);
+    const map = {seed:"seed", noise_seed:"seed", steps:"steps", cfg:"cfg",
+                 sampler_name:"sampler", scheduler:"scheduler", denoise:"denoise"};
+    for (const src in map){
+      let v = ins[src];
+      if (Array.isArray(v)) v = resolveScalar(graph, v, src);
+      const dst = map[src];
+      if ((typeof v === "number" || (typeof v === "string" && v !== "")) && out.params[dst] == null){
+        out.params[dst] = v;
+      }
+    }
+  }
+  if (!out.prompt) out.prompt = fallbackText(graph);
+  // A negative identical to the positive means the chain ran through a no-op
+  // branch (ConditioningZeroOut and friends), not that it was typed twice.
+  if (out.negative && out.negative === out.prompt) out.negative = "";
+
+  // ckpt/unet name the actual model; model_name is usually an upscaler.
+  const modelRank = ["ckpt_name","unet_name","model_name","model"];
+  const models = {}; const loras = [];
+  let width = null, height = null;
+  for (const nid in graph){
+    const ins = graph[nid].inputs || {};
+    modelRank.forEach((k, rank)=>{
+      const v = ins[k];
+      if (typeof v === "string" && v.trim() && models[rank] == null) models[rank] = v;
+    });
+    if (typeof ins.lora_name === "string" && ins.lora_name.trim()){
+      const st = ins.strength_model != null ? ins.strength_model : ins.strength;
+      loras.push(typeof st === "number" ? `${ins.lora_name} (${st})` : ins.lora_name);
+    }
+    if (width == null && typeof ins.width === "number" && typeof ins.height === "number"){
+      width = ins.width; height = ins.height;
+    }
+  }
+  for (let r = 0; r < modelRank.length; r++){ if (models[r]){ out.model = models[r]; break; } }
+  if (loras.length) out.params.loras = loras;
+  if (width) out.params.size = `${width}×${height}`;
+  return out;
+}
+
+/* A1111 / Forge: "positive\nNegative prompt: ...\nSteps: 20, Sampler: ..., Seed: 1" */
+function parseA1111(text){
+  const out = {params:{}};
+  const lines = text.split("\n");
+  let cut = lines.findIndex(l => /^Steps:\s/.test(l.trim()));
+  if (cut < 0) cut = lines.length;
+  const head = lines.slice(0, cut).join("\n");
+  const negAt = head.indexOf("Negative prompt:");
+  out.prompt = (negAt >= 0 ? head.slice(0, negAt) : head).trim();
+  out.negative = negAt >= 0 ? head.slice(negAt + 16).trim() : "";
+  const tail = lines.slice(cut).join(", ");
+  const grab = (re)=>{ const m = tail.match(re); return m ? m[1].trim() : null; };
+  const map = {seed:/Seed:\s*([^,]+)/, steps:/Steps:\s*([^,]+)/, cfg:/CFG scale:\s*([^,]+)/,
+               sampler:/Sampler:\s*([^,]+)/, size:/Size:\s*([^,]+)/};
+  for (const k in map){ const v = grab(map[k]); if (v) out.params[k] = v; }
+  const model = grab(/Model:\s*([^,]+)/);
+  if (model) out.model = model;
+  return out;
+}
+
+/* Returns {prompt, negative, tool, model, params} or null when nothing is embedded. */
+async function extractEmbedded(file, name){
+  if (!/\.png$/i.test(name)) return null;     // only PNG carries this today
+  let chunks = null;
+  try{ chunks = await readPngTextChunks(file); }catch(e){ return null; }
+  if (!chunks) return null;
+  if (chunks.prompt){
+    try{
+      const got = extractFromComfyGraph(JSON.parse(chunks.prompt));
+      got.tool = "ComfyUI";
+      if (chunks.workflow) got.hasWorkflow = true;
+      return got;
+    }catch(e){ /* not a ComfyUI graph; fall through */ }
+  }
+  if (chunks.parameters){
+    const got = parseA1111(chunks.parameters);
+    got.tool = "A1111";
+    return got;
+  }
+  return null;
+}
+
+/* Fills only blanks, so a hand-written note is never overwritten by a re-scan. */
+function applyEmbedded(entry, meta){
+  if (!meta) return false;
+  let touched = false;
+  const set = (k, v)=>{ if (v && !entry[k]){ entry[k] = v; touched = true; } };
+  set("prompt", meta.prompt);
+  set("negative", meta.negative);
+  set("tool", meta.tool);
+  set("model", meta.model);
+  if (meta.params && meta.params.seed != null && !entry.seed){
+    entry.seed = String(meta.params.seed); touched = true;
+  }
+  if (meta.params && Object.keys(meta.params).length && !entry.params){
+    entry.params = meta.params; touched = true;
+  }
+  if (touched){ entry.autoMeta = true; entry.needInfo = !entry.prompt; }
+  return touched;
+}
+
+const OWN_FILE_RE = /^metadata(\.json(\.tmp)?|\.backup\.json|\.corrupt-.*\.json)$/i;
+
+async function scanOrphans(opts){
+  opts = opts || {};
   const known = new Set(db.entries.map(e=>e.filename));
   const found = [];
   for await (const [name, handle] of rootHandle.entries()){
-    if (handle.kind === "file" && MEDIA_RE.test(name) && name !== "metadata.json" && !known.has(name)){
+    if (handle.kind === "file" && MEDIA_RE.test(name) && !OWN_FILE_RE.test(name) && !known.has(name)){
       found.push(name);
     }
   }
-  if (!found.length) return;
+  if (!found.length){
+    if (opts.manual) toast("새로 추가된 파일이 없어요.");
+    return 0;
+  }
+  if (opts.manual) toast(`${found.length}개를 읽는 중...`);
+  let auto = 0;
   for (const name of found){
     const fh = await rootHandle.getFileHandle(name);
     const file = await fh.getFile();
     const type = VIDEO_RE.test(name) ? "video" : "image";
     let thumb = "";
     try{ thumb = await makeThumb(file, type); }catch(e){}
-    db.entries.unshift({
-      id: crypto.randomUUID(), filename:name, type, prompt:"", tool:"", tags:[],
-      seed:"", notes:"", favorite:false, needInfo:true, thumb,
+    const entry = {
+      id: crypto.randomUUID(), filename:name, type, prompt:"", negative:"", tool:"", tags:[],
+      seed:"", model:"", notes:"", favorite:false, needInfo:true, thumb,
       createdAt: new Date(file.lastModified || Date.now()).toISOString()
-    });
+    };
+    try{
+      if (applyEmbedded(entry, await extractEmbedded(file, name))) auto++;
+    }catch(e){ console.warn("meta extract failed", name, e); }
+    db.entries.unshift(entry);
   }
   await saveMeta();
-  toast(`새 파일 ${found.length}개를 찾았어요. 정보를 채워주세요.`);
+  toast(auto
+    ? `새 파일 ${found.length}개 · 그중 ${auto}개는 프롬프트를 자동으로 읽었어요.`
+    : `새 파일 ${found.length}개를 찾았어요. 정보를 채워주세요.`);
+  return found.length;
+}
+
+/* Re-reads embedded metadata for entries that are still blank — for a library
+   that was imported before extraction existed. */
+async function backfillMeta(){
+  const targets = db.entries.filter(e => !e.autoMeta && !e.prompt && /\.png$/i.test(e.filename));
+  if (!targets.length){ toast("자동 추출할 항목이 없어요."); return; }
+  toast(`${targets.length}개를 다시 읽는 중...`);
+  let filled = 0;
+  for (const e of targets){
+    try{
+      const file = await (await rootHandle.getFileHandle(e.filename)).getFile();
+      if (applyEmbedded(e, await extractEmbedded(file, e.filename))) filled++;
+    }catch(err){ /* file gone or unreadable: leave the entry alone */ }
+  }
+  await saveMeta();
+  render();
+  toast(`${filled}개에서 프롬프트를 찾았어요.`);
 }
 
 /* ---------- thumbnails ---------- */
@@ -473,6 +847,7 @@ async function addFiles(fileList){
   const files = Array.from(fileList).filter(f => MEDIA_RE.test(f.name));
   if (!files.length){ toast("이미지/영상 파일만 추가할 수 있어요."); return; }
   const queue = [];
+  let autoFilled = 0;
   for (const file of files){
     const name = await uniqueName(file.name.normalize());
     const fh = await rootHandle.getFileHandle(name, {create:true});
@@ -483,17 +858,26 @@ async function addFiles(fileList){
     let thumb = "";
     try{ thumb = await makeThumb(file, type); }catch(e){}
     const entry = {
-      id: crypto.randomUUID(), filename:name, type, prompt:"", tool: queue.length? "" : (lastTool||""),
-      tags:[], seed:"", notes:"", favorite:false, needInfo:false, thumb,
+      id: crypto.randomUUID(), filename:name, type, prompt:"", negative:"", tool:"",
+      tags:[], seed:"", model:"", notes:"", favorite:false, needInfo:false, thumb,
       createdAt: new Date().toISOString()
     };
+    try{
+      if (applyEmbedded(entry, await extractEmbedded(file, name))) autoFilled++;
+    }catch(e){ console.warn("meta extract failed", name, e); }
+    if (!entry.tool) entry.tool = lastTool || "";   // embedded tool wins over the sticky one
+    entry.needInfo = !entry.prompt;
     db.entries.unshift(entry);
     queue.push(entry);
   }
   await saveMeta();
   render();
-  toast(`${files.length}개 파일을 추가했어요.`);
-  openEditModal(queue[0].id, {isNew:true, queue: queue.slice(1).map(e=>e.id)});
+  toast(autoFilled
+    ? `${files.length}개 추가 · ${autoFilled}개는 프롬프트를 자동으로 읽었어요.`
+    : `${files.length}개 파일을 추가했어요.`);
+  // Everything already filled in? Then there is nothing to prompt the user for.
+  const needsInput = queue.filter(e => !e.prompt);
+  if (needsInput.length) openEditModal(needsInput[0].id, {isNew:true, queue: needsInput.slice(1).map(e=>e.id)});
 }
 
 let lastTool = "";
@@ -519,7 +903,10 @@ function filtered(){
     const q = state.search.toLowerCase();
     list = list.filter(e=>
       (e.prompt||"").toLowerCase().includes(q) ||
+      (e.negative||"").toLowerCase().includes(q) ||
       (e.tool||"").toLowerCase().includes(q) ||
+      (e.model||"").toLowerCase().includes(q) ||
+      (e.seed||"").toLowerCase().includes(q) ||
       (e.notes||"").toLowerCase().includes(q) ||
       (e.tags||[]).some(t=>t.toLowerCase().includes(q))
     );
@@ -558,6 +945,10 @@ function render(){
       const nb = document.createElement("div");
       nb.className = "badge-need"; nb.textContent = "정보 필요";
       thumbWrap.appendChild(nb);
+    } else if (e.autoMeta){
+      const ab = document.createElement("div");
+      ab.className = "badge-auto"; ab.textContent = "AUTO";
+      thumbWrap.appendChild(ab);
     }
     const favBtn = document.createElement("button");
     favBtn.className = "fav-btn" + (e.favorite?" is-fav":"");
@@ -622,6 +1013,38 @@ function mkChip(label, active, onClick, count){
 }
 function escapeHtml(s){ return (s||"").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
+const PARAM_LABELS = {steps:"steps", cfg:"cfg", sampler:"sampler", scheduler:"scheduler",
+                      denoise:"denoise", size:"size", loras:"LoRA"};
+function renderParams(host, entry){
+  host.innerHTML = "";
+  const p = entry.params;
+  if (!p || !Object.keys(p).length) return;
+  const box = document.createElement("div");
+  box.className = "param-box";
+  const head = document.createElement("div");
+  head.className = "param-head";
+  head.textContent = entry.autoMeta ? "파일에서 자동으로 읽은 값" : "생성 파라미터";
+  box.appendChild(head);
+  const list = document.createElement("div");
+  list.className = "param-list";
+  Object.keys(PARAM_LABELS).forEach(k=>{
+    if (p[k] == null) return;
+    const v = Array.isArray(p[k]) ? p[k].join(", ") : p[k];
+    const chip = document.createElement("span");
+    chip.className = "param-chip";
+    chip.innerHTML = `<b>${escapeHtml(PARAM_LABELS[k])}</b> ${escapeHtml(String(v))}`;
+    list.appendChild(chip);
+  });
+  box.appendChild(list);
+  host.appendChild(box);
+}
+
+document.getElementById("rescanBtn").onclick = async ()=>{
+  const n = await scanOrphans({manual:true});
+  if (n) render();
+};
+document.getElementById("backfillBtn").onclick = backfillMeta;
+
 document.getElementById("searchInput").oninput = (e)=>{ state.search = e.target.value; render(); };
 document.getElementById("sortSel").onchange = (e)=>{ state.sort = e.target.value; render(); };
 
@@ -643,7 +1066,7 @@ async function openEditModal(id, opts){
     const fh = await rootHandle.getFileHandle(entry.filename);
     const file = await fh.getFile();
     const url = URL.createObjectURL(file);
-    objectUrls.push(url);
+    modalUrls.push(url);
     mediaPane.innerHTML = "";
     if (entry.type === "video"){
       const v = document.createElement("video"); v.src=url; v.controls=true; v.autoplay=false;
@@ -655,11 +1078,14 @@ async function openEditModal(id, opts){
   }catch(e){ mediaPane.innerHTML = `<div style="color:#999;padding:20px;">파일을 불러올 수 없어요: ${escapeHtml(entry.filename)}</div>`; }
 
   wrap.querySelector('[data-f="prompt"]').value = entry.prompt || "";
+  wrap.querySelector('[data-f="negative"]').value = entry.negative || "";
   wrap.querySelector('[data-f="tool"]').value = entry.tool || "";
   wrap.querySelector('[data-f="seed"]').value = entry.seed || "";
+  wrap.querySelector('[data-f="model"]').value = entry.model || "";
   wrap.querySelector('[data-f="tagsRaw"]').value = (entry.tags||[]).join(", ");
   wrap.querySelector('[data-f="notes"]').value = entry.notes || "";
   wrap.querySelector("[data-fn]").textContent = entry.filename;
+  renderParams(wrap.querySelector("[data-params]"), entry);
   const favBtn = wrap.querySelector("[data-fav]");
   const syncFav = ()=>{ favBtn.textContent = entry.favorite ? "★" : "☆"; favBtn.style.color = entry.favorite ? "var(--accent)" : ""; };
   syncFav();
@@ -667,6 +1093,8 @@ async function openEditModal(id, opts){
 
   function closeModal(){
     wrap.remove(); activeModal = null;
+    // Without this the full-resolution file stays resident for the tab's life.
+    modalUrls.splice(0).forEach(u => URL.revokeObjectURL(u));
     document.removeEventListener("keydown", escHandler);
   }
   function escHandler(ev){ if (ev.key === "Escape") closeModal(); }
@@ -691,8 +1119,10 @@ async function openEditModal(id, opts){
 
   async function doSave(){
     entry.prompt = wrap.querySelector('[data-f="prompt"]').value.trim();
+    entry.negative = wrap.querySelector('[data-f="negative"]').value.trim();
     entry.tool = wrap.querySelector('[data-f="tool"]').value.trim();
     entry.seed = wrap.querySelector('[data-f="seed"]').value.trim();
+    entry.model = wrap.querySelector('[data-f="model"]').value.trim();
     entry.notes = wrap.querySelector('[data-f="notes"]').value.trim();
     entry.tags = wrap.querySelector('[data-f="tagsRaw"]').value.split(",").map(s=>s.trim()).filter(Boolean);
     entry.needInfo = !entry.prompt;
