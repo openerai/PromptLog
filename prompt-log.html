@@ -224,6 +224,15 @@ main{padding:8px 28px 60px;}
   width:72px;height:72px;display:flex;align-items:center;justify-content:center;
   font-size:26px;color:var(--accent);background:var(--accent-soft);
 }
+.ref-progress{
+  position:absolute;left:0;right:0;top:66px;height:3px;background:rgba(0,0,0,0.25);
+}
+.ref-progress i{display:block;height:100%;width:0;background:var(--accent);transition:width .15s linear;}
+.lightbox{
+  position:fixed;inset:0;z-index:70;background:rgba(0,0,0,0.88);
+  display:flex;align-items:center;justify-content:center;padding:24px;cursor:zoom-out;
+}
+.lightbox img,.lightbox video{max-width:96vw;max-height:92vh;object-fit:contain;cursor:default;}
 .ref-play{
   position:absolute;left:4px;bottom:22px;width:18px;height:18px;border-radius:50%;
   background:rgba(0,0,0,0.6);color:#fff;font-size:8px;
@@ -1028,6 +1037,9 @@ async function fillRefsFromInput(list, opts){
         if (r.kind === "video"){
           try{ r.poster = await writeRefPoster(f); }catch(err){}
         }
+        if (r.kind !== "image"){
+          try{ r.dur = await probeDuration(f, r.kind); }catch(err){}
+        }
         r.auto = true;                      // resolved, not hand-attached
         filled++;
       }catch(err){ /* not in the input folder: leave the slot empty */ }
@@ -1068,9 +1080,12 @@ async function syncInputChip(){
 async function attachRef(entry, file, slotId){
   const stored = await writeRefFile(file, file.name || "ref");
   const kind = refKind(file);
-  let poster = "";
+  let poster = "", dur = 0;
   if (kind === "video"){
     try{ poster = await writeRefPoster(file); }catch(e){ /* undecodable: glyph */ }
+  }
+  if (kind !== "image"){
+    try{ dur = await probeDuration(file, kind); }catch(e){}
   }
   entry.refs = entry.refs || [];
   let ref = slotId ? entry.refs.find(r => r.id === slotId) : null;
@@ -1080,9 +1095,10 @@ async function attachRef(entry, file, slotId){
     ref.size = file.size;
     ref.kind = kind;
     ref.poster = poster;
+    ref.dur = dur;
   } else {
     ref = {id: crypto.randomUUID(), name: file.name || "ref", file: stored,
-           size: file.size, kind, poster, from: "upload"};
+           size: file.size, kind, poster, dur, from: "upload"};
     entry.refs.push(ref);
   }
   return ref;
@@ -1487,6 +1503,54 @@ function refreshCard(entry){
 }
 
 /* ---------- reference images in the modal ---------- */
+
+/* Opening a blob in a new tab is blocked by the popup blocker, so everything
+   is viewed in-page instead. */
+function openLightbox(file, kind){
+  const url = URL.createObjectURL(file);
+  const box = document.createElement("div");
+  box.className = "lightbox";
+  const media = kind === "video"
+    ? Object.assign(document.createElement("video"), {src:url, controls:true, autoplay:true})
+    : Object.assign(document.createElement("img"), {src:url});
+  box.appendChild(media);
+  const close = ()=>{
+    box.remove();
+    URL.revokeObjectURL(url);
+    document.removeEventListener("keydown", onKey, true);
+  };
+  function onKey(e){
+    if (e.key !== "Escape") return;
+    e.stopPropagation();            // don't let the modal close underneath
+    close();
+  }
+  box.onclick = (e)=>{ if (e.target === box) close(); };
+  document.addEventListener("keydown", onKey, true);
+  document.body.appendChild(box);
+}
+
+function fmtDur(sec){
+  if (!sec || !isFinite(sec)) return "";
+  const m = Math.floor(sec / 60), s = Math.round(sec % 60);
+  return `${m}:${String(s).padStart(2,"0")}`;
+}
+
+/* Duration is worth storing: an audio reference shows nothing but a glyph, so
+   its length is the only thing distinguishing a sting from a full track. */
+function probeDuration(file, kind){
+  return new Promise(res=>{
+    const el = kind === "audio" ? new Audio() : document.createElement("video");
+    const u = URL.createObjectURL(file);
+    let settled = false;
+    const done = (v)=>{ if (settled) return; settled = true; URL.revokeObjectURL(u); res(v); };
+    el.onloadedmetadata = ()=> done(isFinite(el.duration) ? el.duration : 0);
+    el.onerror = ()=> done(0);
+    setTimeout(()=> done(0), 5000);
+    el.preload = "metadata";
+    el.src = u;
+  });
+}
+
 function pickRefFiles(multiple){
   return new Promise(res=>{
     const input = document.createElement("input");
@@ -1500,6 +1564,33 @@ function setupRefs(wrap, entry){
   const zone = wrap.querySelector("[data-refs]");
   let urls = [];
   let paintGen = 0;
+
+  /* One player for the whole strip: starting a second clip stops the first. */
+  let player = null, playingId = null;
+  function stopAudio(){
+    if (!player) return;
+    player.pause();
+    if (player._face) player._face.textContent = "♪";
+    if (player._fill) player._fill.style.width = "0%";
+    URL.revokeObjectURL(player.src);
+    player = null; playingId = null;
+  }
+  async function toggleAudio(ref, face, fill){
+    if (playingId === ref.id){ stopAudio(); return; }
+    stopAudio();
+    const f = await readRefFile(ref).catch(()=>null);
+    if (!f) return;
+    const a = new Audio(URL.createObjectURL(f));
+    a._face = face; a._fill = fill;
+    a.ontimeupdate = ()=>{
+      if (a.duration) fill.style.width = (a.currentTime / a.duration * 100) + "%";
+    };
+    a.onended = stopAudio;
+    a.onerror = stopAudio;
+    player = a; playingId = ref.id;
+    face.textContent = "⏸";
+    try{ await a.play(); }catch(e){ stopAudio(); }
+  }
 
   /* Painting reads files, so two overlapping runs (a drop plus a background
      repaint) would each clear the zone and then append their own cells. Build
@@ -1539,18 +1630,20 @@ function setupRefs(wrap, entry){
         cell.classList.add("kind-" + kind);
         const open = async ()=>{
           const f = await readRefFile(ref).catch(()=>null);
-          if (!f) return;
-          const u = URL.createObjectURL(f);
-          window.open(u, "_blank", "noopener");
-          setTimeout(()=>URL.revokeObjectURL(u), 60000);
+          if (f) openLightbox(f, kind);
         };
 
         if (kind === "audio"){
           const face = document.createElement("div");
           face.className = "ref-glyph";
           face.textContent = "♪";
-          face.onclick = open;
+          const bar = document.createElement("div");
+          bar.className = "ref-progress";
+          const fill = document.createElement("i");
+          bar.appendChild(fill);
+          face.onclick = ()=> toggleAudio(ref, face, fill);
           cell.appendChild(face);
+          cell.appendChild(bar);
         } else {
           const img = document.createElement("img");
           try{
@@ -1603,7 +1696,8 @@ function setupRefs(wrap, entry){
 
       const cap = document.createElement("div");
       cap.className = "ref-name";
-      cap.textContent = ref.name;
+      const dur = fmtDur(ref.dur);
+      cap.textContent = dur ? `${ref.name} · ${dur}` : ref.name;
       cell.appendChild(cap);
 
       const del = document.createElement("button");
@@ -1643,6 +1737,7 @@ function setupRefs(wrap, entry){
 
   wrap._releaseRefs = ()=>{
     paintGen++;                     // cancel any paint still in flight
+    stopAudio();
     urls.splice(0).forEach(u => URL.revokeObjectURL(u));
   };
   // A background fill can land while this modal is open; let it repaint.
