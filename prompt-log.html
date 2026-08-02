@@ -204,6 +204,38 @@ main{padding:8px 28px 60px;}
   background:rgba(0,0,0,0.4);border:none;color:#fff;display:flex;align-items:center;justify-content:center;z-index:2;
 }
 .filename-note{font-size:11px;color:var(--text-faint);}
+.ref-tag{font-size:10.5px;color:var(--text-dim);background:var(--bg-elev-2);padding:2px 7px;border-radius:5px;}
+.field label .ref-add{float:right;margin-top:-4px;text-transform:none;letter-spacing:0;}
+.ref-zone{
+  display:flex;flex-wrap:wrap;gap:8px;padding:8px;min-height:56px;
+  border:1px dashed var(--border);border-radius:9px;background:var(--bg-elev-2);
+  transition:border-color .15s ease,background .15s ease;
+}
+.ref-zone.drop-on{border-color:var(--accent);background:var(--accent-soft);}
+.ref-empty{font-size:11.5px;color:var(--text-faint);align-self:center;padding:4px 2px;line-height:1.4;}
+.ref-cell{
+  position:relative;width:72px;border-radius:8px;overflow:hidden;
+  background:var(--bg-elev);border:1px solid var(--border);
+}
+.ref-cell img{width:72px;height:72px;object-fit:cover;display:block;cursor:zoom-in;background:var(--bg-elev-2);}
+.ref-cell.is-slot{border-style:dashed;cursor:pointer;}
+.ref-cell.is-slot:hover,.ref-cell.drop-on{border-color:var(--accent);}
+.ref-cell.drop-on{background:var(--accent-soft);}
+.ref-slot-face{
+  width:72px;height:72px;display:flex;align-items:center;justify-content:center;
+  color:var(--text-faint);font-size:20px;
+}
+.ref-cell.is-slot:hover .ref-slot-face{color:var(--accent);}
+.ref-name{
+  font-size:9.5px;color:var(--text-faint);padding:3px 5px;line-height:1.25;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;direction:rtl;text-align:left;
+}
+.ref-del{
+  position:absolute;top:3px;right:3px;width:18px;height:18px;border-radius:50%;
+  border:none;background:rgba(0,0,0,0.55);color:#fff;font-size:10px;line-height:1;
+  display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .15s ease;
+}
+.ref-cell:hover .ref-del{opacity:1;}
 .param-box{border:1px solid var(--border);border-radius:9px;padding:9px 11px;background:var(--bg-elev-2);}
 .param-head{font-size:10.5px;text-transform:uppercase;letter-spacing:0.3px;color:var(--text-faint);font-weight:700;margin-bottom:7px;}
 .param-list{display:flex;flex-wrap:wrap;gap:5px;}
@@ -313,6 +345,10 @@ main{padding:8px 28px 60px;}
       <div class="field"><label>모델 / 체크포인트</label><input data-f="model" placeholder="선택"></div>
       <div class="field"><label>태그 (쉼표로 구분)</label><input data-f="tagsRaw" placeholder="예: 인물, 실사, 야간"></div>
       <div class="field"><label>메모</label><textarea data-f="notes" style="min-height:60px;" placeholder="선택"></textarea></div>
+      <div class="field">
+        <label>참조 이미지 <button class="btn small ref-add" data-ref-add>＋ 추가</button></label>
+        <div class="ref-zone" data-refs></div>
+      </div>
       <div data-params></div>
       <div class="filename-note" data-fn></div>
       <div class="modal-actions">
@@ -516,6 +552,7 @@ function showFatal(quarantineName){
 
 const MEDIA_RE = /\.(png|jpe?g|webp|gif|bmp|avif|mp4|webm|mov|m4v)$/i;
 const VIDEO_RE = /\.(mp4|webm|mov|m4v)$/i;
+const REF_EXT_RE = /\.(png|jpe?g|webp|bmp|gif|avif)$/i;
 
 /* =======================================================================
    Embedded generation metadata
@@ -700,6 +737,20 @@ function extractFromComfyGraph(graph){
   for (let r = 0; r < modelRank.length; r++){ if (models[r]){ out.model = models[r]; break; } }
   if (loras.length) out.params.loras = loras;
   if (width) out.params.size = `${width}×${height}`;
+
+  // Any input holding an image filename names a reference the run was fed —
+  // LoadImage in practice, but keyed on the value so other loader nodes work
+  // too. filename_prefix is an output name, not an input.
+  const refNames = [];
+  for (const nid in graph){
+    const ins = graph[nid].inputs || {};
+    for (const k in ins){
+      if (k === "filename_prefix") continue;
+      const v = ins[k];
+      if (typeof v === "string" && REF_EXT_RE.test(v) && refNames.indexOf(v) < 0) refNames.push(v);
+    }
+  }
+  if (refNames.length) out.refNames = refNames;
   return out;
 }
 
@@ -759,6 +810,12 @@ function applyEmbedded(entry, meta){
   }
   if (meta.params && Object.keys(meta.params).length && !entry.params){
     entry.params = meta.params; touched = true;
+  }
+  // Names only — the files themselves live in the generator's input folder,
+  // outside the library. They become slots the user can attach an image to.
+  if (meta.refNames && meta.refNames.length && !(entry.refs || []).length){
+    entry.refs = meta.refNames.map(n => ({id: crypto.randomUUID(), name: n, file: "", from: "graph"}));
+    touched = true;
   }
   if (touched){ entry.autoMeta = true; entry.needInfo = !entry.prompt; }
   return touched;
@@ -829,6 +886,59 @@ function makeCanvas(w, h){
    different — so a large first import wants the tab left in the foreground. */
 function canvasToBlob(canvas, quality){
   return new Promise(res => canvas.toBlob(res, "image/jpeg", quality));
+}
+
+/* =======================================================================
+   Reference images
+   A ref always carries the source filename. It carries stored bytes only
+   once one is attached, so a name recovered from the graph can sit in the
+   list as an empty slot until the user supplies the actual file.
+   ======================================================================= */
+const REF_DIR = ".refs";
+
+async function refsDir(create){
+  return rootHandle.getDirectoryHandle(REF_DIR, {create: !!create});
+}
+async function writeRefFile(file, name){
+  const dir = await refsDir(true);
+  const dot = name.lastIndexOf(".");
+  const ext = dot > 0 ? name.slice(dot) : "";
+  const stored = crypto.randomUUID() + ext;
+  const fh = await dir.getFileHandle(stored, {create:true});
+  const w = await fh.createWritable();
+  await w.write(file);
+  await w.close();
+  return stored;
+}
+async function readRefFile(ref){
+  if (!ref || !ref.file) return null;
+  const dir = await refsDir(false);
+  return (await dir.getFileHandle(ref.file)).getFile();
+}
+async function removeRefFile(ref){
+  if (!ref || !ref.file) return;
+  try{ (await refsDir(false)).removeEntry(ref.file); }catch(e){}
+}
+async function removeAllRefFiles(entry){
+  for (const r of entry.refs || []) await removeRefFile(r);
+}
+
+/* Attach real bytes to an entry: either filling a graph-named slot or adding
+   a new one. Returns the ref that now holds the file. */
+async function attachRef(entry, file, slotId){
+  const stored = await writeRefFile(file, file.name || "ref");
+  entry.refs = entry.refs || [];
+  let ref = slotId ? entry.refs.find(r => r.id === slotId) : null;
+  if (ref){
+    await removeRefFile(ref);                 // replacing an earlier attachment
+    ref.file = stored;
+    ref.size = file.size;
+  } else {
+    ref = {id: crypto.randomUUID(), name: file.name || "ref", file: stored,
+           size: file.size, from: "upload"};
+    entry.refs.push(ref);
+  }
+  return ref;
 }
 
 /* Returns {blob, w, h} — the dimensions let cards reserve space before the
@@ -1224,6 +1334,124 @@ function refreshCard(entry){
   }
 }
 
+/* ---------- reference images in the modal ---------- */
+function pickImageFiles(multiple){
+  return new Promise(res=>{
+    const input = document.createElement("input");
+    input.type = "file"; input.accept = "image/*"; input.multiple = !!multiple;
+    input.onchange = ()=> res(Array.from(input.files || []));
+    input.click();
+  });
+}
+
+function setupRefs(wrap, entry){
+  const zone = wrap.querySelector("[data-refs]");
+  const urls = [];
+
+  async function paint(){
+    urls.splice(0).forEach(u => URL.revokeObjectURL(u));
+    zone.innerHTML = "";
+    const refs = entry.refs || [];
+    if (!refs.length){
+      const hint = document.createElement("div");
+      hint.className = "ref-empty";
+      hint.textContent = "이 결과물을 만들 때 참고한 이미지를 끌어다 놓거나 ＋ 추가";
+      zone.appendChild(hint);
+      return;
+    }
+    for (const ref of refs){
+      const cell = document.createElement("div");
+      cell.className = "ref-cell" + (ref.file ? "" : " is-slot");
+      cell.title = ref.name + (ref.file ? "" : " (그래프에서 읽은 이름 · 클릭해서 파일 첨부)");
+
+      if (ref.file){
+        const img = document.createElement("img");
+        try{
+          const f = await readRefFile(ref);
+          if (f){
+            const u = URL.createObjectURL(f);
+            urls.push(u);
+            img.src = u;
+          }
+        }catch(e){ cell.classList.add("is-broken"); }
+        cell.appendChild(img);
+        img.onclick = async ()=>{
+          const f = await readRefFile(ref).catch(()=>null);
+          if (!f) return;
+          const u = URL.createObjectURL(f);
+          window.open(u, "_blank", "noopener");
+          setTimeout(()=>URL.revokeObjectURL(u), 30000);
+        };
+      } else {
+        const slot = document.createElement("div");
+        slot.className = "ref-slot-face";
+        slot.textContent = "＋";
+        cell.appendChild(slot);
+        const fill = async (file)=>{
+          await attachRef(entry, file, ref.id);   // keeps the graph-supplied name
+          await saveMeta(); paint(); render();
+        };
+        cell.onclick = async ()=>{
+          const files = await pickImageFiles(false);
+          if (files.length) await fill(files[0]);
+        };
+        // Dropping straight onto the placeholder fills that slot rather than
+        // appending a new reference beside it.
+        ["dragenter","dragover"].forEach(t => cell.addEventListener(t, ev=>{
+          ev.preventDefault(); ev.stopPropagation(); cell.classList.add("drop-on");
+        }));
+        ["dragleave","drop"].forEach(t => cell.addEventListener(t, ev=>{
+          ev.preventDefault(); ev.stopPropagation(); cell.classList.remove("drop-on");
+        }));
+        cell.addEventListener("drop", async (ev)=>{
+          const f = Array.from(ev.dataTransfer.files || []).find(x => x.type.startsWith("image/"));
+          if (f) await fill(f);
+        });
+      }
+
+      const cap = document.createElement("div");
+      cap.className = "ref-name";
+      cap.textContent = ref.name;
+      cell.appendChild(cap);
+
+      const del = document.createElement("button");
+      del.className = "ref-del"; del.textContent = "✕"; del.title = "제거";
+      del.onclick = async (ev)=>{
+        ev.stopPropagation();
+        await removeRefFile(ref);
+        entry.refs = (entry.refs || []).filter(r => r.id !== ref.id);
+        await saveMeta(); paint(); render();
+      };
+      cell.appendChild(del);
+      zone.appendChild(cell);
+    }
+  }
+
+  wrap.querySelector("[data-ref-add]").onclick = async (ev)=>{
+    ev.preventDefault();
+    const files = await pickImageFiles(true);
+    for (const f of files) await attachRef(entry, f);
+    if (files.length){ await saveMeta(); paint(); render(); }
+  };
+
+  // Dropping here must attach a reference, not import a new library entry.
+  ["dragenter","dragover"].forEach(t => zone.addEventListener(t, e=>{
+    e.preventDefault(); e.stopPropagation(); zone.classList.add("drop-on");
+  }));
+  ["dragleave","drop"].forEach(t => zone.addEventListener(t, e=>{
+    e.preventDefault(); e.stopPropagation(); zone.classList.remove("drop-on");
+  }));
+  zone.addEventListener("drop", async (e)=>{
+    const files = Array.from(e.dataTransfer.files || []).filter(f => f.type.startsWith("image/"));
+    if (!files.length) return;
+    for (const f of files) await attachRef(entry, f);
+    await saveMeta(); paint(); render();
+  });
+
+  wrap._releaseRefs = ()=> urls.splice(0).forEach(u => URL.revokeObjectURL(u));
+  paint();
+}
+
 function setStatus(msg){
   const el = document.getElementById("statusLabel");
   if (el) el.textContent = msg || "";
@@ -1288,6 +1516,15 @@ function render(){
     const meta = document.createElement("div");
     meta.className = "card-meta";
     if (e.tool){ const tt = document.createElement("span"); tt.className="tool-tag"; tt.textContent=e.tool; meta.appendChild(tt); }
+    const refs = e.refs || [];
+    if (refs.length){
+      const rt = document.createElement("span");
+      rt.className = "ref-tag";
+      const attached = refs.filter(r => r.file).length;
+      rt.textContent = "🖼 " + (attached === refs.length ? refs.length : `${attached}/${refs.length}`);
+      rt.title = refs.map(r => r.name).join("\n");
+      meta.appendChild(rt);
+    }
     const slash = e.filename.lastIndexOf("/");
     if (slash > 0){
       const fold = document.createElement("span");
@@ -1415,12 +1652,14 @@ async function openEditModal(id, opts){
   wrap.querySelector('[data-f="notes"]').value = entry.notes || "";
   wrap.querySelector("[data-fn]").textContent = entry.filename;
   renderParams(wrap.querySelector("[data-params]"), entry);
+  setupRefs(wrap, entry);
   const favBtn = wrap.querySelector("[data-fav]");
   const syncFav = ()=>{ favBtn.textContent = entry.favorite ? "★" : "☆"; favBtn.style.color = entry.favorite ? "var(--accent)" : ""; };
   syncFav();
   favBtn.onclick = ()=>{ entry.favorite = !entry.favorite; syncFav(); };
 
   function closeModal(){
+    if (wrap._releaseRefs) wrap._releaseRefs();
     wrap.remove(); activeModal = null;
     // Without this the full-resolution file stays resident for the tab's life.
     modalUrls.splice(0).forEach(u => URL.revokeObjectURL(u));
@@ -1440,6 +1679,7 @@ async function openEditModal(id, opts){
     if (!confirm(`이 항목을 삭제할까요?\n원본 파일도 함께 삭제됩니다:\n${entry.filename}`)) return;
     try{ await removeFileAt(entry.filename); }catch(e){}
     await removeThumbFile(entry);
+    await removeAllRefFiles(entry);
     db.entries = db.entries.filter(x=>x.id!==entry.id);
     await saveMeta();
     closeModal();
@@ -1482,6 +1722,7 @@ document.getElementById("addBtn").onclick = ()=>{
 let dragCounter = 0;
 window.addEventListener("dragenter", (e)=>{
   if (document.getElementById("appView").style.display === "none") return;
+  if (activeModal) return;          // a drop in the modal attaches a reference
   dragCounter++;
   document.getElementById("dropzone").classList.add("active");
 });
@@ -1495,6 +1736,7 @@ window.addEventListener("drop", (e)=>{
   dragCounter = 0;
   document.getElementById("dropzone").classList.remove("active");
   if (document.getElementById("appView").style.display === "none") return;
+  if (activeModal) return;
   if (e.dataTransfer.files && e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
 });
 
@@ -1548,7 +1790,21 @@ document.getElementById("exportBtn").onclick = async ()=>{
         }
       }catch(err){}
     }
-    items.push({e, mediaSrc, isFull});
+    // References go in downscaled — they are context, not the deliverable.
+    const refs = [];
+    for (const r of e.refs || []){
+      if (!r.file){ refs.push({name: r.name, src: ""}); continue; }
+      try{
+        const f = await readRefFile(r);
+        if (!f) { refs.push({name: r.name, src: ""}); continue; }
+        const bmp = await createImageBitmap(f, {resizeWidth: 320, resizeQuality: "medium"});
+        const cv = makeCanvas(bmp.width, bmp.height);
+        cv.getContext("2d").drawImage(bmp, 0, 0);
+        bmp.close();
+        refs.push({name: r.name, src: await toDataUrl(await canvasToBlob(cv, 0.72))});
+      }catch(err){ refs.push({name: r.name, src: ""}); }
+    }
+    items.push({e, mediaSrc, isFull, refs});
     if (++n % 20 === 0) setStatus(`내보내는 중 ${n}/${list.length}...`);
   }
   setStatus("");
@@ -1562,7 +1818,13 @@ document.getElementById("exportBtn").onclick = async ()=>{
 };
 
 function buildExportHtml(items){
-  const cards = items.map(({e,mediaSrc,isFull})=>{
+  const cards = items.map(({e,mediaSrc,isFull,refs})=>{
+    const refStrip = (refs && refs.length)
+      ? `<div class="ref-list"><div class="ref-head">참조 이미지</div>${refs.map(r =>
+          r.src ? `<img class="ref-thumb" src="${r.src}" title="${escapeHtml(r.name)}">`
+                : `<span class="ref-miss" title="${escapeHtml(r.name)}">${escapeHtml(r.name)}</span>`
+        ).join("")}</div>`
+      : "";
     const media = e.type === "video"
       ? (isFull ? `<video src="${mediaSrc}" controls style="width:100%;display:block;"></video>` : `<img src="${mediaSrc}" style="width:100%;display:block;">`)
       : `<img src="${mediaSrc}" style="width:100%;display:block;">`;
@@ -1574,12 +1836,18 @@ function buildExportHtml(items){
         <div class="card-meta">${e.tool?`<span class="tool-tag">${escapeHtml(e.tool)}</span>`:""}<span class="date-tag">${new Date(e.createdAt).toLocaleDateString("ko-KR")}</span></div>
         ${tags?`<div class="tag-list">${tags}</div>`:""}
         ${e.notes?`<div style="margin-top:8px;font-size:12px;color:var(--text-dim);">${escapeHtml(e.notes)}</div>`:""}
+        ${refStrip}
       </div>
     </div>`;
   }).join("\n");
   const styleTag = document.querySelector("style").outerHTML;
   return `<!DOCTYPE html><html lang="ko" data-theme="dark"><head><meta charset="UTF-8"><title>Prompt Log Export</title>${styleTag}
-  <style>body{padding:20px;} main{padding:20px 0;} header{position:static;background:none;padding:0 0 20px;} .brand h1{font-size:26px;}</style>
+  <style>body{padding:20px;} main{padding:20px 0;} header{position:static;background:none;padding:0 0 20px;} .brand h1{font-size:26px;}
+  .ref-list{margin-top:9px;padding-top:8px;border-top:1px solid var(--border);display:flex;flex-wrap:wrap;gap:5px;align-items:center;}
+  .ref-head{font-size:9.5px;text-transform:uppercase;letter-spacing:.3px;color:var(--text-faint);font-weight:700;width:100%;}
+  .ref-thumb{width:52px;height:52px;object-fit:cover;border-radius:6px;border:1px solid var(--border);}
+  .ref-miss{font-size:10px;color:var(--text-faint);background:var(--bg-elev-2);padding:3px 7px;border-radius:5px;
+    max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}</style>
   </head><body>
   <header><div class="header-top"><div class="brand"><h1>Prompt Log<span class="dot">.</span></h1></div>
   <span style="color:var(--text-faint);font-size:13px;">${items.length}개 항목 · ${new Date().toLocaleDateString("ko-KR")} 내보냄</span></div></header>
