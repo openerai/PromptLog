@@ -219,6 +219,22 @@ main{padding:8px 28px 60px;}
   background:var(--bg-elev);border:1px solid var(--border);
 }
 .ref-cell img{width:72px;height:72px;object-fit:cover;display:block;cursor:zoom-in;background:var(--bg-elev-2);}
+.ref-cell.kind-video img,.ref-cell.kind-audio .ref-glyph{cursor:pointer;}
+.ref-glyph{
+  width:72px;height:72px;display:flex;align-items:center;justify-content:center;
+  font-size:26px;color:var(--accent);background:var(--accent-soft);
+}
+.ref-play{
+  position:absolute;left:4px;bottom:22px;width:18px;height:18px;border-radius:50%;
+  background:rgba(0,0,0,0.6);color:#fff;font-size:8px;
+  display:flex;align-items:center;justify-content:center;pointer-events:none;
+}
+.ref-cell.no-poster img{min-height:72px;}
+.ref-cell.no-poster::before{
+  content:"▶";position:absolute;top:0;left:0;width:72px;height:72px;
+  display:flex;align-items:center;justify-content:center;
+  color:var(--text-faint);font-size:22px;background:var(--bg-elev-2);
+}
 .ref-cell.is-slot{border-style:dashed;cursor:pointer;}
 .ref-cell.is-slot:hover,.ref-cell.drop-on{border-color:var(--accent);}
 .ref-cell.drop-on{background:var(--accent-soft);}
@@ -558,7 +574,28 @@ function showFatal(quarantineName){
 
 const MEDIA_RE = /\.(png|jpe?g|webp|gif|bmp|avif|mp4|webm|mov|m4v)$/i;
 const VIDEO_RE = /\.(mp4|webm|mov|m4v)$/i;
-const REF_EXT_RE = /\.(png|jpe?g|webp|bmp|gif|avif)$/i;
+/* References are multimodal: current generators take image, video and audio
+   as conditioning inputs, so all three have to be storable and recognisable. */
+const REF_EXT_RE   = /\.(png|jpe?g|webp|bmp|gif|avif|mp4|webm|mov|m4v|mp3|wav|m4a|ogg|opus|flac|aac)$/i;
+const REF_VIDEO_RE = /\.(mp4|webm|mov|m4v)$/i;
+const REF_AUDIO_RE = /\.(mp3|wav|m4a|ogg|opus|flac|aac)$/i;
+const REF_ACCEPT   = "image/*,video/*,audio/*";
+
+/* Prefer the MIME type when we have a real File; fall back to the extension,
+   which is all a name recovered from a graph gives us. */
+function refKind(nameOrFile){
+  const t = (nameOrFile && nameOrFile.type) || "";
+  if (t.startsWith("image/")) return "image";
+  if (t.startsWith("video/")) return "video";
+  if (t.startsWith("audio/")) return "audio";
+  const name = (nameOrFile && nameOrFile.name) || String(nameOrFile || "");
+  if (REF_VIDEO_RE.test(name)) return "video";
+  if (REF_AUDIO_RE.test(name)) return "audio";
+  return "image";
+}
+function isRefFile(f){
+  return /^(image|video|audio)\//.test(f.type || "") || REF_EXT_RE.test(f.name || "");
+}
 
 /* =======================================================================
    Embedded generation metadata
@@ -924,6 +961,25 @@ async function readRefFile(ref){
 async function removeRefFile(ref){
   if (!ref || !ref.file) return;
   try{ (await refsDir(false)).removeEntry(ref.file); }catch(e){}
+  if (ref.poster){ try{ (await refsDir(false)).removeEntry(ref.poster); }catch(e){} }
+}
+
+/* Video references get a still so the strip paints without decoding the clip
+   on every repaint. Audio has nothing to show, so it gets a glyph instead. */
+async function writeRefPoster(file){
+  const thumb = await makeThumbBlob(file, "video");
+  const dir = await refsDir(true);
+  const name = crypto.randomUUID() + ".jpg";
+  const fh = await dir.getFileHandle(name, {create:true});
+  const w = await fh.createWritable();
+  await w.write(thumb.blob);
+  await w.close();
+  return name;
+}
+async function readRefPoster(ref){
+  if (!ref || !ref.poster) return null;
+  const dir = await refsDir(false);
+  return (await dir.getFileHandle(ref.poster)).getFile();
 }
 async function removeAllRefFiles(entry){
   for (const r of entry.refs || []) await removeRefFile(r);
@@ -968,6 +1024,10 @@ async function fillRefsFromInput(list, opts){
         if (!f) continue;
         r.file = await writeRefFile(f, r.name);
         r.size = f.size;
+        r.kind = refKind({name: r.name, type: f.type});
+        if (r.kind === "video"){
+          try{ r.poster = await writeRefPoster(f); }catch(err){}
+        }
         r.auto = true;                      // resolved, not hand-attached
         filled++;
       }catch(err){ /* not in the input folder: leave the slot empty */ }
@@ -1007,15 +1067,22 @@ async function syncInputChip(){
    a new one. Returns the ref that now holds the file. */
 async function attachRef(entry, file, slotId){
   const stored = await writeRefFile(file, file.name || "ref");
+  const kind = refKind(file);
+  let poster = "";
+  if (kind === "video"){
+    try{ poster = await writeRefPoster(file); }catch(e){ /* undecodable: glyph */ }
+  }
   entry.refs = entry.refs || [];
   let ref = slotId ? entry.refs.find(r => r.id === slotId) : null;
   if (ref){
     await removeRefFile(ref);                 // replacing an earlier attachment
     ref.file = stored;
     ref.size = file.size;
+    ref.kind = kind;
+    ref.poster = poster;
   } else {
     ref = {id: crypto.randomUUID(), name: file.name || "ref", file: stored,
-           size: file.size, from: "upload"};
+           size: file.size, kind, poster, from: "upload"};
     entry.refs.push(ref);
   }
   return ref;
@@ -1420,10 +1487,10 @@ function refreshCard(entry){
 }
 
 /* ---------- reference images in the modal ---------- */
-function pickImageFiles(multiple){
+function pickRefFiles(multiple){
   return new Promise(res=>{
     const input = document.createElement("input");
-    input.type = "file"; input.accept = "image/*"; input.multiple = !!multiple;
+    input.type = "file"; input.accept = REF_ACCEPT; input.multiple = !!multiple;
     input.onchange = ()=> res(Array.from(input.files || []));
     input.click();
   });
@@ -1431,17 +1498,35 @@ function pickImageFiles(multiple){
 
 function setupRefs(wrap, entry){
   const zone = wrap.querySelector("[data-refs]");
-  const urls = [];
+  let urls = [];
+  let paintGen = 0;
 
+  /* Painting reads files, so two overlapping runs (a drop plus a background
+     repaint) would each clear the zone and then append their own cells. Build
+     off-document, and let only the newest run swap itself in. */
   async function paint(){
-    urls.splice(0).forEach(u => URL.revokeObjectURL(u));
-    zone.innerHTML = "";
+    const gen = ++paintGen;
+    const frag = document.createDocumentFragment();
+    const fresh = [];
+    const commit = ()=>{
+      if (gen !== paintGen){                  // superseded while we were reading
+        fresh.forEach(u => URL.revokeObjectURL(u));
+        return false;
+      }
+      urls.forEach(u => URL.revokeObjectURL(u));
+      urls = fresh;
+      zone.innerHTML = "";
+      zone.appendChild(frag);
+      return true;
+    };
+
     const refs = entry.refs || [];
     if (!refs.length){
       const hint = document.createElement("div");
       hint.className = "ref-empty";
-      hint.textContent = "이 결과물을 만들 때 참고한 이미지를 끌어다 놓거나 ＋ 추가";
-      zone.appendChild(hint);
+      hint.textContent = "이 결과물을 만들 때 참고한 이미지·영상·오디오를 끌어다 놓거나 ＋ 추가";
+      frag.appendChild(hint);
+      commit();
       return;
     }
     for (const ref of refs){
@@ -1450,23 +1535,45 @@ function setupRefs(wrap, entry){
       cell.title = ref.name + (ref.file ? "" : " (그래프에서 읽은 이름 · 클릭해서 파일 첨부)");
 
       if (ref.file){
-        const img = document.createElement("img");
-        try{
-          const f = await readRefFile(ref);
-          if (f){
-            const u = URL.createObjectURL(f);
-            urls.push(u);
-            img.src = u;
-          }
-        }catch(e){ cell.classList.add("is-broken"); }
-        cell.appendChild(img);
-        img.onclick = async ()=>{
+        const kind = ref.kind || refKind(ref.name);
+        cell.classList.add("kind-" + kind);
+        const open = async ()=>{
           const f = await readRefFile(ref).catch(()=>null);
           if (!f) return;
           const u = URL.createObjectURL(f);
           window.open(u, "_blank", "noopener");
-          setTimeout(()=>URL.revokeObjectURL(u), 30000);
+          setTimeout(()=>URL.revokeObjectURL(u), 60000);
         };
+
+        if (kind === "audio"){
+          const face = document.createElement("div");
+          face.className = "ref-glyph";
+          face.textContent = "♪";
+          face.onclick = open;
+          cell.appendChild(face);
+        } else {
+          const img = document.createElement("img");
+          try{
+            // Video shows its stored poster; only an image shows itself.
+            const f = kind === "video" ? await readRefPoster(ref) : await readRefFile(ref);
+            if (f){
+              const u = URL.createObjectURL(f);
+              fresh.push(u);
+              img.src = u;
+            } else if (kind === "video"){
+              cell.classList.add("no-poster");
+            }
+          }catch(e){ cell.classList.add("is-broken"); }
+          img.onclick = open;
+          cell.appendChild(img);
+          if (kind === "video"){
+            const play = document.createElement("div");
+            play.className = "ref-play";
+            play.textContent = "▶";
+            play.onclick = open;
+            cell.appendChild(play);
+          }
+        }
       } else {
         const slot = document.createElement("div");
         slot.className = "ref-slot-face";
@@ -1477,7 +1584,7 @@ function setupRefs(wrap, entry){
           await saveMeta(); paint(); render();
         };
         cell.onclick = async ()=>{
-          const files = await pickImageFiles(false);
+          const files = await pickRefFiles(false);
           if (files.length) await fill(files[0]);
         };
         // Dropping straight onto the placeholder fills that slot rather than
@@ -1489,7 +1596,7 @@ function setupRefs(wrap, entry){
           ev.preventDefault(); ev.stopPropagation(); cell.classList.remove("drop-on");
         }));
         cell.addEventListener("drop", async (ev)=>{
-          const f = Array.from(ev.dataTransfer.files || []).find(x => x.type.startsWith("image/"));
+          const f = Array.from(ev.dataTransfer.files || []).find(isRefFile);
           if (f) await fill(f);
         });
       }
@@ -1508,13 +1615,14 @@ function setupRefs(wrap, entry){
         await saveMeta(); paint(); render();
       };
       cell.appendChild(del);
-      zone.appendChild(cell);
+      frag.appendChild(cell);
     }
+    commit();
   }
 
   wrap.querySelector("[data-ref-add]").onclick = async (ev)=>{
     ev.preventDefault();
-    const files = await pickImageFiles(true);
+    const files = await pickRefFiles(true);
     for (const f of files) await attachRef(entry, f);
     if (files.length){ await saveMeta(); paint(); render(); }
   };
@@ -1527,13 +1635,16 @@ function setupRefs(wrap, entry){
     e.preventDefault(); e.stopPropagation(); zone.classList.remove("drop-on");
   }));
   zone.addEventListener("drop", async (e)=>{
-    const files = Array.from(e.dataTransfer.files || []).filter(f => f.type.startsWith("image/"));
+    const files = Array.from(e.dataTransfer.files || []).filter(isRefFile);
     if (!files.length) return;
     for (const f of files) await attachRef(entry, f);
     await saveMeta(); paint(); render();
   });
 
-  wrap._releaseRefs = ()=> urls.splice(0).forEach(u => URL.revokeObjectURL(u));
+  wrap._releaseRefs = ()=>{
+    paintGen++;                     // cancel any paint still in flight
+    urls.splice(0).forEach(u => URL.revokeObjectURL(u));
+  };
   // A background fill can land while this modal is open; let it repaint.
   wrap._repaintRefs = paint;
   paint();
@@ -1608,7 +1719,10 @@ function render(){
       const rt = document.createElement("span");
       rt.className = "ref-tag";
       const attached = refs.filter(r => r.file).length;
-      rt.textContent = "🖼 " + (attached === refs.length ? refs.length : `${attached}/${refs.length}`);
+      const kinds = new Set(refs.map(r => r.kind || refKind(r.name)));
+      const icon = ["image","video","audio"].filter(k => kinds.has(k))
+        .map(k => k === "image" ? "🖼" : k === "video" ? "🎬" : "♪").join("");
+      rt.textContent = icon + " " + (attached === refs.length ? refs.length : `${attached}/${refs.length}`);
       rt.title = refs.map(r => r.name).join("\n");
       meta.appendChild(rt);
     }
@@ -1903,16 +2017,19 @@ document.getElementById("exportBtn").onclick = async ()=>{
     // References go in downscaled — they are context, not the deliverable.
     const refs = [];
     for (const r of e.refs || []){
-      if (!r.file){ refs.push({name: r.name, src: ""}); continue; }
+      const kind = r.kind || refKind(r.name);
+      if (!r.file){ refs.push({name: r.name, src: "", kind}); continue; }
+      // Audio has no still to show; video exports its stored poster.
+      if (kind === "audio"){ refs.push({name: r.name, src: "", kind}); continue; }
       try{
-        const f = await readRefFile(r);
-        if (!f) { refs.push({name: r.name, src: ""}); continue; }
+        const f = kind === "video" ? await readRefPoster(r) : await readRefFile(r);
+        if (!f) { refs.push({name: r.name, src: "", kind}); continue; }
         const bmp = await createImageBitmap(f, {resizeWidth: 320, resizeQuality: "medium"});
         const cv = makeCanvas(bmp.width, bmp.height);
         cv.getContext("2d").drawImage(bmp, 0, 0);
         bmp.close();
-        refs.push({name: r.name, src: await toDataUrl(await canvasToBlob(cv, 0.72))});
-      }catch(err){ refs.push({name: r.name, src: ""}); }
+        refs.push({name: r.name, src: await toDataUrl(await canvasToBlob(cv, 0.72)), kind});
+      }catch(err){ refs.push({name: r.name, src: "", kind}); }
     }
     items.push({e, mediaSrc, isFull, refs});
     if (++n % 20 === 0) setStatus(`내보내는 중 ${n}/${list.length}...`);
@@ -1930,9 +2047,14 @@ document.getElementById("exportBtn").onclick = async ()=>{
 function buildExportHtml(items){
   const cards = items.map(({e,mediaSrc,isFull,refs})=>{
     const refStrip = (refs && refs.length)
-      ? `<div class="ref-list"><div class="ref-head">참조 이미지</div>${refs.map(r =>
-          r.src ? `<img class="ref-thumb" src="${r.src}" title="${escapeHtml(r.name)}">`
-                : `<span class="ref-miss" title="${escapeHtml(r.name)}">${escapeHtml(r.name)}</span>`
+      ? `<div class="ref-list"><div class="ref-head">참조</div>${refs.map(r =>
+          r.src ? `<span class="ref-wrap">
+                     <img class="ref-thumb" src="${r.src}" title="${escapeHtml(r.name)}">
+                     ${r.kind === "video" ? '<span class="ref-kind">▶</span>' : ""}
+                   </span>`
+                : `<span class="ref-miss" title="${escapeHtml(r.name)}">${
+                     r.kind === "audio" ? "♪ " : r.kind === "video" ? "▶ " : ""
+                   }${escapeHtml(r.name)}</span>`
         ).join("")}</div>`
       : "";
     const media = e.type === "video"
@@ -1955,7 +2077,10 @@ function buildExportHtml(items){
   <style>body{padding:20px;} main{padding:20px 0;} header{position:static;background:none;padding:0 0 20px;} .brand h1{font-size:26px;}
   .ref-list{margin-top:9px;padding-top:8px;border-top:1px solid var(--border);display:flex;flex-wrap:wrap;gap:5px;align-items:center;}
   .ref-head{font-size:9.5px;text-transform:uppercase;letter-spacing:.3px;color:var(--text-faint);font-weight:700;width:100%;}
+  .ref-wrap{position:relative;display:inline-block;line-height:0;}
   .ref-thumb{width:52px;height:52px;object-fit:cover;border-radius:6px;border:1px solid var(--border);}
+  .ref-kind{position:absolute;left:3px;bottom:3px;width:15px;height:15px;border-radius:50%;
+    background:rgba(0,0,0,0.6);color:#fff;font-size:7px;line-height:15px;text-align:center;}
   .ref-miss{font-size:10px;color:var(--text-faint);background:var(--bg-elev-2);padding:3px 7px;border-radius:5px;
     max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}</style>
   </head><body>
