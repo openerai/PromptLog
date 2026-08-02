@@ -125,6 +125,7 @@ main{padding:8px 28px 60px;}
 @keyframes shimmer{from{background-position:180% 0;}to{background-position:-40% 0;}}
 .card.is-pending{opacity:0.75;}
 .status-label{font-size:12px;color:var(--accent);margin-left:2px;}
+.btn.connected{border-color:var(--accent);color:var(--accent);}
 .badge-type{
   position:absolute;top:8px;left:8px;background:rgba(0,0,0,0.55);color:#fff;
   font-size:10.5px;padding:3px 7px;border-radius:6px;display:flex;align-items:center;gap:4px;
@@ -296,6 +297,7 @@ main{padding:8px 28px 60px;}
     <div class="folder-chip">📁 <strong id="folderName"></strong></div>
     <button class="btn small" id="rescanBtn" title="폴더에 새로 생긴 파일 읽기">↻ 새로고침</button>
     <button class="btn small" id="backfillBtn" title="비어 있는 항목에서 PNG에 박힌 프롬프트 다시 추출">✨ 자동 추출</button>
+    <button class="btn small" id="inputFolderBtn">🔗 input 폴더</button>
     <button class="btn small" id="switchFolderBtn">폴더 변경</button>
     <button class="btn icon small" id="themeBtn" title="테마 전환">🌙</button>
     <button class="btn small" id="exportBtn">⤓ 내보내기</button>
@@ -414,6 +416,9 @@ async function boot(){
     show("gateView");
     return;
   }
+  // Restored without asking for permission — that needs a user gesture, so the
+  // header chip shows the locked state until it is clicked.
+  inputHandle = await idbGet("inputDir").catch(()=>null);
   const saved = await idbGet("rootDir").catch(()=>null);
   if (saved){
     rootHandle = saved;
@@ -451,6 +456,7 @@ async function pickFolder(){
 async function openLibrary(){
   document.getElementById("folderName").textContent = rootHandle.name;
   show("appView");
+  syncInputChip();
   if (!await loadMeta()) return;   // corrupt metadata: stop before touching anything
   render();
   await migrateInlineThumbs();
@@ -923,6 +929,80 @@ async function removeAllRefFiles(entry){
   for (const r of entry.refs || []) await removeRefFile(r);
 }
 
+/* ---------- resolving graph-named refs from the generator's input folder ----------
+   A name recovered from the graph is just text; the bytes sit in ComfyUI's
+   input/ folder, outside the library. Connect that folder once and the empty
+   slots fill themselves. The bytes are copied into .refs/ rather than linked,
+   so the library stays self-contained if input/ is later cleaned out. */
+let inputHandle = null;
+
+async function resolveInputFile(name){
+  if (!inputHandle) return null;
+  const clean = String(name)
+    .replace(/\s*\[(input|output|temp)\]\s*$/i, "")   // ComfyUI type annotation
+    .replace(/\\/g, "/")
+    .trim();
+  const parts = clean.split("/").filter(Boolean);
+  const base = parts.pop();
+  let dir = inputHandle;
+  for (const p of parts) dir = await dir.getDirectoryHandle(p);
+  // Korean filenames can differ only by unicode normalisation between whatever
+  // wrote the graph and what is on disk, so try the common forms.
+  for (const candidate of [base, base.normalize("NFC"), base.normalize("NFD")]){
+    try{ return await (await dir.getFileHandle(candidate)).getFile(); }
+    catch(e){ /* try the next form */ }
+  }
+  return null;
+}
+
+async function fillRefsFromInput(list, opts){
+  opts = opts || {};
+  if (!inputHandle) return 0;
+  const targets = (list || db.entries).filter(e => (e.refs || []).some(r => !r.file));
+  let filled = 0, n = 0;
+  for (const e of targets){
+    for (const r of e.refs){
+      if (r.file) continue;
+      try{
+        const f = await resolveInputFile(r.name);
+        if (!f) continue;
+        r.file = await writeRefFile(f, r.name);
+        r.size = f.size;
+        r.auto = true;                      // resolved, not hand-attached
+        filled++;
+      }catch(err){ /* not in the input folder: leave the slot empty */ }
+    }
+    if (!opts.quiet && ++n % 25 === 0) setStatus(`참조 이미지 ${filled}개 채우는 중...`);
+  }
+  if (!opts.quiet){
+    setStatus("");
+    if (filled){ await saveMeta(); render(); }
+  }
+  return filled;
+}
+
+async function inputPermission(){
+  if (!inputHandle || !inputHandle.queryPermission) return "granted";
+  try{ return await inputHandle.queryPermission({mode:"read"}); }catch(e){ return "prompt"; }
+}
+
+async function syncInputChip(){
+  const btn = document.getElementById("inputFolderBtn");
+  if (!btn) return;
+  if (!inputHandle){
+    btn.textContent = "🔗 input 폴더";
+    btn.classList.remove("connected");
+    btn.title = "ComfyUI input 폴더를 연결하면 그래프에서 읽은 참조 이미지가 자동으로 채워집니다";
+    return;
+  }
+  const perm = await inputPermission();
+  btn.classList.toggle("connected", perm === "granted");
+  btn.textContent = (perm === "granted" ? "🔗 " : "🔒 ") + inputHandle.name;
+  btn.title = perm === "granted"
+    ? `참조 이미지를 ${inputHandle.name} 에서 찾습니다. 다시 누르면 다른 폴더로 바꿉니다.`
+    : "접근 권한이 필요합니다. 눌러서 다시 허용해주세요.";
+}
+
 /* Attach real bytes to an entry: either filling a graph-named slot or adding
    a new one. Returns the ref that now holds the file. */
 async function attachRef(entry, file, slotId){
@@ -1088,7 +1168,7 @@ async function processPending(list){
   if (processing) return;
   processing = true;
   const queue = (list && list.length) ? list : db.entries.filter(e => e.pending);
-  let done = 0, auto = 0, moved = 0, dirtyView = false;
+  let done = 0, auto = 0, moved = 0, refsFilled = 0, dirtyView = false;
   for (const e of queue){
     try{
       const file = await getFileAt(e.filename);
@@ -1108,6 +1188,10 @@ async function processPending(list){
       try{
         if (applyEmbedded(e, await extractEmbedded(file, e.filename))) auto++;
       }catch(err){ console.warn("meta extract failed", e.filename, err); }
+      try{
+        // Quiet: the loop's own checkpoints handle saving and repainting.
+        refsFilled += await fillRefsFromInput([e], {quiet:true});
+      }catch(err){ /* input folder unavailable */ }
       try{
         await writeThumbFile(e, await makeThumbBlob(file, e.type));
       }catch(err){ console.warn("thumb failed", e.filename, err); }
@@ -1131,6 +1215,7 @@ async function processPending(list){
   const parts = [];
   if (auto) parts.push(`${auto}개에서 프롬프트를 자동으로 읽었어요`);
   if (moved) parts.push(`${moved}개는 옮겨진 파일로 인식해 기록을 이어붙였어요`);
+  if (refsFilled) parts.push(`참조 이미지 ${refsFilled}개를 찾아 붙였어요`);
   toast(parts.length ? "처리 완료 · " + parts.join(" · ") : "처리 완료.");
   await statBackfill();
 }
@@ -1449,6 +1534,8 @@ function setupRefs(wrap, entry){
   });
 
   wrap._releaseRefs = ()=> urls.splice(0).forEach(u => URL.revokeObjectURL(u));
+  // A background fill can land while this modal is open; let it repaint.
+  wrap._repaintRefs = paint;
   paint();
 }
 
@@ -1546,6 +1633,7 @@ function render(){
   });
   grid.appendChild(frag);
   primeThumbs();
+  if (activeModal && activeModal._repaintRefs) activeModal._repaintRefs();
 }
 
 function renderChips(){
@@ -1604,6 +1692,28 @@ function renderParams(host, entry){
   });
   box.appendChild(list);
   host.appendChild(box);
+}
+
+document.getElementById("inputFolderBtn").onclick = async ()=>{
+  try{
+    // Needing permission is the common case on a fresh session; handle that
+    // before offering to pick a different folder.
+    if (inputHandle && await inputPermission() !== "granted"){
+      if (await inputHandle.requestPermission({mode:"read"}) === "granted"){
+        await afterInputConnected();
+        return;
+      }
+    }
+    inputHandle = await window.showDirectoryPicker({mode:"read"});
+    await idbSet("inputDir", inputHandle);
+    await afterInputConnected();
+  }catch(e){ if (e.name !== "AbortError") console.error(e); }
+};
+
+async function afterInputConnected(){
+  await syncInputChip();
+  const n = await fillRefsFromInput();
+  toast(n ? `참조 이미지 ${n}개를 자동으로 채웠어요.` : "새로 채울 참조 이미지가 없어요.");
 }
 
 document.getElementById("rescanBtn").onclick = async ()=>{
