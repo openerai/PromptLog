@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Prompt Log</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23141419'/%3E%3Cpath d='M18 13h22l8 8v30H18z' fill='%23e0b15c'/%3E%3Cpath d='M40 13v10h8' fill='none' stroke='%23141419' stroke-width='4' stroke-linejoin='round'/%3E%3Cpath d='M27 29h9a7 7 0 0 1 0 14h-9V29zm0 14v8' fill='none' stroke='%23141419' stroke-width='5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
 :root{
   --bg:#0b0b0e;
@@ -1996,7 +1997,14 @@ async function openEditModal(id, opts){
 
   wrap.querySelector("[data-delete]").onclick = async ()=>{
     if (!confirm(`이 항목을 삭제할까요?\n원본 파일도 함께 삭제됩니다:\n${entry.filename}`)) return;
-    try{ await removeFileAt(entry.filename); }catch(e){}
+    if (!entry.missing){
+      try{
+        await removeFileAt(entry.filename);
+      }catch(e){
+        alert(`원본 파일을 삭제하지 못했습니다. 항목은 그대로 유지됩니다.\n\n${e.message || e}`);
+        return;
+      }
+    }
     await removeThumbFile(entry);
     await removeAllRefFiles(entry);
     db.entries = db.entries.filter(x=>x.id!==entry.id);
