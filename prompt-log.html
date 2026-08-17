@@ -144,12 +144,21 @@ main{padding:8px 28px 60px;}
 .card:hover .fav-btn{opacity:1;}
 .fav-btn.is-fav{opacity:1;color:var(--accent);}
 .card-body{padding:12px 13px 13px;}
+.card-prompt-row{display:flex;align-items:flex-start;gap:8px;}
 .card-prompt{
+  flex:1;min-width:0;
   font-size:13px;line-height:1.5;color:var(--text);
   display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;
   min-height:1.5em;
 }
 .card-prompt.empty{color:var(--text-faint);font-style:italic;}
+.card-copy-btn{
+  flex:0 0 auto;border:1px solid var(--border);background:var(--bg-elev-2);color:var(--text-dim);
+  padding:4px 7px;border-radius:7px;font-size:11px;line-height:1.2;
+  transition:border-color .15s ease,color .15s ease,background .15s ease;
+}
+.card-copy-btn:hover{border-color:var(--accent);color:var(--accent);background:var(--accent-soft);}
+.card-copy-btn:disabled{cursor:default;opacity:.35;border-color:var(--border);color:var(--text-faint);background:var(--bg-elev-2);}
 .card-meta{display:flex;align-items:center;gap:8px;margin-top:10px;flex-wrap:wrap;}
 .tool-tag{
   font-size:11px;font-weight:600;color:var(--accent);background:var(--accent-soft);
@@ -342,6 +351,7 @@ main{padding:8px 28px 60px;}
     <span style="font-size:12px;color:var(--text-faint);margin-left:4px;" id="countLabel"></span>
     <span class="status-label" id="statusLabel"></span>
   </div>
+  <div class="chipbar" id="typeChipBar"></div>
   <div class="chipbar" id="toolChipBar"></div>
   <div class="chipbar" id="tagChipBar"></div>
 </header>
@@ -397,7 +407,7 @@ main{padding:8px 28px 60px;}
 
 let rootHandle = null;
 let db = {version:1, entries:[]};
-let state = {search:"", tool:null, tag:null, sort:"new", needOnly:false};
+let state = {search:"", type:null, tool:null, tag:null, sort:"new", needOnly:false};
 let modalUrls = [];   // object URLs owned by the open modal; revoked on close
 
 /* ---------- idb for handle persistence ---------- */
@@ -431,6 +441,22 @@ function toast(msg){
   t.textContent = msg; t.classList.add("show");
   clearTimeout(toast._t);
   toast._t = setTimeout(()=>t.classList.remove("show"), 2200);
+}
+async function copyPrompt(text){
+  if (!text){ toast("복사할 프롬프트가 없어요."); return; }
+  try{
+    await navigator.clipboard.writeText(text);
+  }catch(e){
+    const input = document.createElement("textarea");
+    input.value = text;
+    input.style.cssText = "position:fixed;left:-9999px;top:0";
+    document.body.appendChild(input);
+    input.focus(); input.select();
+    const copied = document.execCommand("copy");
+    input.remove();
+    if (!copied){ toast("복사하지 못했어요."); return; }
+  }
+  toast("프롬프트를 복사했어요.");
 }
 function show(id){ ["gateView","reconnectView","fatalView","appView"].forEach(v=>{document.getElementById(v).style.display = v===id?"":"none";}); }
 
@@ -1410,6 +1436,7 @@ function distinctTags(){
 
 function filtered(){
   let list = db.entries.slice();
+  if (state.type) list = list.filter(e=>e.type===state.type);
   if (state.tool) list = list.filter(e=>e.tool===state.tool);
   if (state.tag) list = list.filter(e=>(e.tags||[]).includes(state.tag));
   if (state.needOnly) list = list.filter(e=>e.needInfo);
@@ -1803,10 +1830,21 @@ function render(){
 
     const body = document.createElement("div");
     body.className = "card-body";
+    const promptRow = document.createElement("div");
+    promptRow.className = "card-prompt-row";
     const p = document.createElement("div");
     p.className = "card-prompt" + (e.prompt ? "" : " empty");
     p.textContent = e.prompt || "프롬프트가 입력되지 않았어요";
-    body.appendChild(p);
+    promptRow.appendChild(p);
+    const copyBtn = document.createElement("button");
+    copyBtn.className = "card-copy-btn";
+    copyBtn.type = "button";
+    copyBtn.textContent = "⧉ 복사";
+    copyBtn.title = e.prompt ? "프롬프트 복사" : "복사할 프롬프트가 없습니다";
+    copyBtn.disabled = !e.prompt;
+    copyBtn.onclick = (ev)=>{ ev.stopPropagation(); copyPrompt(e.prompt); };
+    promptRow.appendChild(copyBtn);
+    body.appendChild(promptRow);
     const meta = document.createElement("div");
     meta.className = "card-meta";
     if (e.tool){ const tt = document.createElement("span"); tt.className="tool-tag"; tt.textContent=e.tool; meta.appendChild(tt); }
@@ -1847,6 +1885,14 @@ function render(){
 }
 
 function renderChips(){
+  const typeBar = document.getElementById("typeChipBar");
+  typeBar.innerHTML = "";
+  const imageCount = db.entries.filter(e=>e.type==="image").length;
+  const videoCount = db.entries.filter(e=>e.type==="video").length;
+  typeBar.appendChild(mkChip("전체", !state.type, ()=>{ state.type=null; render(); }, db.entries.length));
+  typeBar.appendChild(mkChip("🖼 이미지", state.type==="image", ()=>{ state.type=state.type==="image"?null:"image"; render(); }, imageCount));
+  typeBar.appendChild(mkChip("▶ 영상", state.type==="video", ()=>{ state.type=state.type==="video"?null:"video"; render(); }, videoCount));
+
   const toolBar = document.getElementById("toolChipBar");
   toolBar.innerHTML = "";
   const allChip = mkChip("전체 툴", !state.tool, ()=>{ state.tool=null; render(); });
@@ -1990,10 +2036,7 @@ async function openEditModal(id, opts){
   wrap.querySelector(".scrim").onclick = closeModal;
   wrap.querySelector("[data-close]").onclick = closeModal;
 
-  wrap.querySelector("[data-copy]").onclick = ()=>{
-    navigator.clipboard.writeText(wrap.querySelector('[data-f="prompt"]').value || "");
-    toast("프롬프트를 복사했어요.");
-  };
+  wrap.querySelector("[data-copy]").onclick = ()=> copyPrompt(wrap.querySelector('[data-f="prompt"]').value.trim());
 
   wrap.querySelector("[data-delete]").onclick = async ()=>{
     if (!confirm(`이 항목을 삭제할까요?\n원본 파일도 함께 삭제됩니다:\n${entry.filename}`)) return;

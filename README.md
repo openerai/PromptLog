@@ -11,6 +11,15 @@ ComfyUI로 뽑은 PNG는 **프롬프트·모델·시드가 파일 안에 이미 
 
 ---
 
+## 웹에서 바로 실행
+
+**[Prompt Log 열기](https://openerai.github.io/PromptLog/)**
+
+Chrome 또는 Edge에서 링크를 열고 `📁 폴더 선택하기`를 누르면 됩니다. 웹 버전도 선택한 폴더를
+브라우저에서 직접 읽고 쓰며, 이미지·프롬프트를 별도 서버로 전송하지 않습니다.
+
+---
+
 ## Windows에 설치하기 (일반 사용자)
 
 ### 1. 설치 파일 받기
@@ -82,7 +91,7 @@ Windows에 포함된 .NET Framework C# 컴파일러와 Inno Setup 6를 사용합
 powershell -ExecutionPolicy Bypass -File .\windows\build.ps1
 ```
 
-빌드 결과는 `dist\PromptLog-Setup-0.4.0.exe`입니다. Inno Setup이 없으면 호스트 EXE만
+빌드 결과는 `dist\PromptLog-Setup-0.5.0.exe`입니다. Inno Setup이 없으면 호스트 EXE만
 `build\windows\PromptLog.exe`에 만들어지고 설치 프로그램 빌드는 건너뜁니다.
 
 공개 배포 전에는 반드시 [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md)를 확인하세요.

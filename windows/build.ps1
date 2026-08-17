@@ -69,4 +69,4 @@ if ($isccCandidates.Count -eq 0) {
 
 & ($isccCandidates[0]) (Join-Path $PSScriptRoot "PromptLog.iss")
 if ($LASTEXITCODE -ne 0) { throw "Installer compilation failed with exit code $LASTEXITCODE" }
-Write-Host "Installer built: $(Join-Path $distDir 'PromptLog-Setup-0.4.0.exe')"
+Write-Host "Installer built: $(Join-Path $distDir 'PromptLog-Setup-0.5.0.exe')"
