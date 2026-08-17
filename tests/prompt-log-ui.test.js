@@ -19,6 +19,10 @@ function extractFunction(name) {
 
 assert(html.includes('id="typeChipBar"'), "type filter bar is missing");
 assert(html.includes('copyBtn.textContent = "⧉ 복사"'), "card copy button is missing");
+assert(html.includes('id="mobileViewBtn"'), "mobile view button is missing");
+assert(html.includes('id="mobileFolderInput"'), "mobile folder input is missing");
+assert(html.includes("async function openMobileFiles"), "mobile file loader is missing");
+assert(html.includes('모바일 보기 · 읽기 전용'), "read-only mobile label is missing");
 
 const filteredSource = extractFunction("filtered");
 const entries = [

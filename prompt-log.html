@@ -294,6 +294,10 @@ main{padding:8px 28px 60px;}
 }
 .gate h2{font-size:24px;margin:0;}
 .gate p{color:var(--text-dim);font-size:14px;max-width:420px;margin:0;}
+.gate-actions{display:flex;flex-wrap:wrap;justify-content:center;gap:10px;}
+.gate-note{font-size:12px!important;color:var(--text-faint)!important;line-height:1.6;}
+.view-badge{font-size:11px;font-weight:700;color:var(--accent);border:1px solid var(--accent);background:var(--accent-soft);padding:5px 9px;border-radius:999px;white-space:nowrap;}
+.readonly .fav-btn{display:none;}
 .spinner{width:20px;height:20px;border:2.5px solid var(--border);border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;}
 @keyframes spin{to{transform:rotate(360deg);}}
 @media (max-width:640px){
@@ -307,8 +311,15 @@ main{padding:8px 28px 60px;}
 
 <div id="gateView" class="gate" style="display:none;">
   <h2>Prompt Log</h2>
-  <p>이미지·영상 생성 결과와 그걸 만든 프롬프트를 한곳에 모아두는 독립 로컬 갤러리입니다.<br>결과물을 저장할 폴더를 선택해주세요 (기존 출력 폴더도 가능).</p>
-  <button class="btn primary" id="pickFolderBtn">📁 폴더 선택하기</button>
+  <p id="gateIntro">이미지·영상 생성 결과와 그걸 만든 프롬프트를 한곳에 모아두는 독립 로컬 갤러리입니다.<br>결과물을 저장할 폴더를 선택해주세요 (기존 출력 폴더도 가능).</p>
+  <div class="gate-actions">
+    <button class="btn primary" id="pickFolderBtn">📁 폴더 선택하기</button>
+    <button class="btn" id="mobileFolderBtn">📱 폴더 통째로 보기</button>
+    <button class="btn" id="mobileViewBtn">파일 선택해서 보기</button>
+  </div>
+  <p class="gate-note" id="mobileViewNote">모바일에서는 폴더를 읽기 전용으로 열 수 있어요. 폴더 선택이 안 되면 metadata.json과 이미지·영상 파일을 직접 선택하세요.</p>
+  <input type="file" id="mobileFilesInput" accept=".json,image/*,video/*" multiple hidden>
+  <input type="file" id="mobileFolderInput" webkitdirectory multiple hidden>
 </div>
 
 <div id="reconnectView" class="gate" style="display:none;">
@@ -330,6 +341,7 @@ main{padding:8px 28px 60px;}
   <div class="header-top">
     <div class="brand"><h1>Prompt Log<span class="dot">.</span></h1></div>
     <div class="folder-chip">📁 <strong id="folderName"></strong></div>
+    <span class="view-badge" id="viewModeBadge" style="display:none;">모바일 보기 · 읽기 전용</span>
     <button class="btn small" id="rescanBtn" title="폴더에 새로 생긴 파일 읽기">↻ 새로고침</button>
     <button class="btn small" id="backfillBtn" title="비어 있는 항목에서 PNG에 박힌 프롬프트 다시 추출">✨ 자동 추출</button>
     <button class="btn small" id="inputFolderBtn">🔗 input 폴더</button>
@@ -409,6 +421,9 @@ let rootHandle = null;
 let db = {version:1, entries:[]};
 let state = {search:"", type:null, tool:null, tag:null, sort:"new", needOnly:false};
 let modalUrls = [];   // object URLs owned by the open modal; revoked on close
+let viewOnly = false;
+let mobileFiles = new Map();
+let mobileUrls = [];
 
 /* ---------- idb for handle persistence ---------- */
 function idbOpen(){
@@ -464,7 +479,9 @@ function show(id){ ["gateView","reconnectView","fatalView","appView"].forEach(v=
 async function boot(){
   applyTheme(localStorage.getItem("pl-theme") || (matchMedia("(prefers-color-scheme: light)").matches ? "light":"dark"));
   if (!("showDirectoryPicker" in window)){
-    document.getElementById("gateView").querySelector("p").textContent = "이 기능은 Chrome 또는 Edge 브라우저에서만 사용할 수 있어요.";
+    document.getElementById("gateIntro").textContent = "이 브라우저에서는 폴더를 직접 연결할 수 없어요. 모바일 보기 모드로 파일을 열어보세요.";
+    document.getElementById("pickFolderBtn").style.display = "none";
+    document.getElementById("mobileFolderBtn").classList.add("primary");
     show("gateView");
     return;
   }
@@ -487,6 +504,16 @@ async function boot(){
 }
 
 document.getElementById("pickFolderBtn").onclick = pickFolder;
+document.getElementById("mobileViewBtn").onclick = ()=> document.getElementById("mobileFilesInput").click();
+document.getElementById("mobileFolderBtn").onclick = ()=> document.getElementById("mobileFolderInput").click();
+document.getElementById("mobileFilesInput").onchange = async (e)=>{
+  if (e.target.files && e.target.files.length) await openMobileFiles(e.target.files);
+  e.target.value = "";
+};
+document.getElementById("mobileFolderInput").onchange = async (e)=>{
+  if (e.target.files && e.target.files.length) await openMobileFiles(e.target.files, true);
+  e.target.value = "";
+};
 document.getElementById("reconnectPickOther").onclick = pickFolder;
 document.getElementById("fatalPickOther").onclick = pickFolder;
 document.getElementById("switchFolderBtn").onclick = pickFolder;
@@ -503,6 +530,102 @@ async function pickFolder(){
     await idbSet("rootDir", handle);
     await openLibrary();
   }catch(e){ if (e.name !== "AbortError") console.error(e); }
+}
+
+function mobilePath(file){
+  let p = (file.webkitRelativePath || file.name || "").replace(/\\/g,"/");
+  const slash = p.indexOf("/");
+  if (slash >= 0) p = p.slice(slash + 1);
+  return p.normalize();
+}
+
+function findMobileFile(relPath){
+  const clean = String(relPath || "").replace(/\\/g,"/").normalize();
+  return mobileFiles.get(clean) || mobileFiles.get(clean.split("/").pop()) || null;
+}
+
+function clearMobileUrls(){
+  mobileUrls.splice(0).forEach(url=>URL.revokeObjectURL(url));
+}
+
+async function mobileThumb(entry, file){
+  try{
+    if (entry.type === "image"){
+      const url = URL.createObjectURL(file);
+      mobileUrls.push(url);
+      entry.thumb = url;
+      return;
+    }
+    const thumb = await makeThumbBlob(file, "video");
+    const url = URL.createObjectURL(thumb.blob);
+    mobileUrls.push(url);
+    entry.thumb = url; entry.tw = thumb.w; entry.th = thumb.h;
+  }catch(e){}
+}
+
+async function openMobileFiles(fileList, fromFolder){
+  const chosen = Array.from(fileList);
+  clearMobileUrls();
+  mobileFiles = new Map();
+  chosen.forEach(file=>{
+    const path = mobilePath(file);
+    mobileFiles.set(path, file);
+    if (!mobileFiles.has(file.name)) mobileFiles.set(file.name, file);
+  });
+
+  const meta = chosen.find(file=>/^metadata\.json$/i.test(file.name));
+  let parsed = null;
+  if (meta){
+    try{
+      parsed = JSON.parse(await meta.text());
+      if (!parsed || !Array.isArray(parsed.entries)) throw new Error("shape");
+    }catch(e){
+      toast("metadata.json을 읽을 수 없어요.");
+      return;
+    }
+  }
+
+  const media = chosen.filter(file=>{
+    const path = mobilePath(file);
+    return MEDIA_RE.test(file.name) && !OWN_FILE_RE.test(file.name) &&
+      !path.startsWith(THUMB_DIR + "/") && !path.startsWith(REF_DIR + "/");
+  });
+  if (parsed){
+    db = parsed;
+  } else {
+    db = {version:1, entries:media.map(file=>({
+      id:crypto.randomUUID(), filename:mobilePath(file),
+      type:VIDEO_RE.test(file.name)?"video":"image", prompt:"", negative:"", tool:"",
+      tags:[], seed:"", model:"", notes:"", favorite:false, needInfo:true,
+      createdAt:new Date(file.lastModified || Date.now()).toISOString()
+    }))};
+    for (const entry of db.entries){
+      const file = findMobileFile(entry.filename);
+      if (!file || entry.type !== "image" || !/\.png$/i.test(file.name)) continue;
+      try{ applyEmbedded(entry, await extractEmbedded(file, file.name)); }catch(e){}
+      entry.needInfo = !entry.prompt;
+    }
+  }
+
+  for (const entry of db.entries){
+    delete entry.thumb;
+    const file = findMobileFile(entry.filename);
+    entry.missing = !file;
+    if (file) await mobileThumb(entry, file);
+  }
+
+  viewOnly = true;
+  document.body.classList.add("readonly");
+  document.getElementById("folderName").textContent = meta ? "선택한 Prompt Log" : "선택한 모바일 파일";
+  document.getElementById("viewModeBadge").style.display = "";
+  ["rescanBtn","backfillBtn","inputFolderBtn","addBtn","exportBtn"].forEach(id=>document.getElementById(id).style.display="none");
+  const switchBtn = document.getElementById("switchFolderBtn");
+  switchBtn.textContent = fromFolder ? "폴더 다시 선택" : "파일 다시 선택";
+  switchBtn.onclick = ()=>document.getElementById(fromFolder ? "mobileFolderInput" : "mobileFilesInput").click();
+  document.getElementById("emptyState").querySelector("p").textContent = "metadata.json과 이미지·영상 파일을 함께 선택해주세요.";
+  show("appView");
+  render();
+  toast(meta ? `${db.entries.length}개 항목을 읽기 전용으로 열었어요.` : `${db.entries.length}개 파일을 열었어요.`);
 }
 
 async function openLibrary(){
@@ -574,6 +697,7 @@ async function writeBackupOnce(text){
    mid-write leaves the previous metadata.json intact. */
 let saveChain = Promise.resolve();
 function saveMeta(){
+  if (viewOnly) return Promise.resolve();
   saveChain = saveChain.then(doSaveMeta, doSaveMeta);
   return saveChain;
 }
@@ -923,7 +1047,14 @@ async function fileHandleAt(relPath, opts){
   const dir = await resolveDir(parts, opts);
   return dir.getFileHandle(name, opts);
 }
-async function getFileAt(relPath){ return (await fileHandleAt(relPath)).getFile(); }
+async function getFileAt(relPath){
+  if (viewOnly){
+    const file = findMobileFile(relPath);
+    if (!file) throw new Error("mobile file missing");
+    return file;
+  }
+  return (await fileHandleAt(relPath)).getFile();
+}
 async function removeFileAt(relPath){
   const parts = splitPath(relPath);
   const name = parts.pop();
@@ -1824,7 +1955,7 @@ function render(){
     const favBtn = document.createElement("button");
     favBtn.className = "fav-btn" + (e.favorite?" is-fav":"");
     favBtn.textContent = e.favorite ? "★" : "☆";
-    favBtn.onclick = (ev)=>{ ev.stopPropagation(); e.favorite=!e.favorite; saveMeta(); render(); };
+    favBtn.onclick = (ev)=>{ ev.stopPropagation(); if (viewOnly) return; e.favorite=!e.favorite; saveMeta(); render(); };
     thumbWrap.appendChild(favBtn);
     card.appendChild(thumbWrap);
 
@@ -2018,7 +2149,15 @@ async function openEditModal(id, opts){
   wrap.querySelector('[data-f="notes"]').value = entry.notes || "";
   wrap.querySelector("[data-fn]").textContent = entry.filename;
   renderParams(wrap.querySelector("[data-params]"), entry);
-  setupRefs(wrap, entry);
+  if (viewOnly){
+    wrap.querySelectorAll("input,textarea").forEach(el=>el.readOnly=true);
+    wrap.querySelector("[data-save]").style.display = "none";
+    wrap.querySelector("[data-delete]").style.display = "none";
+    wrap.querySelector("[data-fav]").style.display = "none";
+    wrap.querySelector("[data-refs]").closest(".field").style.display = "none";
+  } else {
+    setupRefs(wrap, entry);
+  }
   const favBtn = wrap.querySelector("[data-fav]");
   const syncFav = ()=>{ favBtn.textContent = entry.favorite ? "★" : "☆"; favBtn.style.color = entry.favorite ? "var(--accent)" : ""; };
   syncFav();
