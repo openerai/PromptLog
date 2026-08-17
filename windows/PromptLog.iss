@@ -1,5 +1,5 @@
 #define MyAppName "Prompt Log"
-#define MyAppVersion "0.4.0"
+#define MyAppVersion "0.5.0"
 #define MyAppPublisher "Prompt Log"
 #define MyAppExeName "PromptLog.exe"
 
@@ -29,7 +29,7 @@ Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "바탕 화면에 바로가기 만들기"; GroupDescription: "추가 바로가기:"; Flags: unchecked
+Name: "desktopicon"; Description: "바탕 화면에 바로가기 만들기"; GroupDescription: "추가 바로가기:"
 
 [Files]
 Source: "..\build\windows\PromptLog.exe"; DestDir: "{app}"; Flags: ignoreversion
