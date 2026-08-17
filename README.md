@@ -13,7 +13,7 @@ ComfyUI로 뽑은 PNG는 **프롬프트·모델·시드가 파일 안에 이미 
 
 ## 웹에서 바로 실행
 
-**[Prompt Log 열기](https://openerai.github.io/PromptLog/)**
+**[Prompt Log 열기](https://prompt-log.juyurani.chatgpt.site/)**
 
 Chrome 또는 Edge에서 링크를 열고 `📁 폴더 선택하기`를 누르면 됩니다. 웹 버전도 선택한 폴더를
 브라우저에서 직접 읽고 쓰며, 이미지·프롬프트를 별도 서버로 전송하지 않습니다.
