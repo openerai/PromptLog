@@ -57,6 +57,37 @@ Windows **설정 → 앱 → 설치된 앱 → Prompt Log → 제거**를 선택
 
 ---
 
+## macOS에서 사용하기
+
+Windows 같은 설치형 앱은 없지만, 웹 앱이라 macOS에서도 그대로 동작합니다.
+
+### 준비물
+
+Chrome 또는 Edge, 그리고 Python. macOS는 보통 `python3`가 기본 설치되어 있습니다.
+없다면 Homebrew로 `brew install python`.
+
+> Safari와 Firefox는 폴더를 읽는 데 쓰는 브라우저 기능(File System Access API)을
+> 지원하지 않아 사용할 수 없습니다.
+
+### 실행하기
+
+1. 이 저장소를 내려받거나 `git clone` 합니다.
+2. `run.command`를 더블클릭합니다. 터미널 창이 열리고 브라우저가 자동으로 켜집니다.
+3. `📁 폴더 선택하기`를 누르고 결과물 폴더를 선택합니다.
+
+> **처음 실행하면 "확인되지 않은 개발자입니다" 경고가 뜰 수 있습니다.** Finder에서
+> `run.command`를 **우클릭(또는 Control 키를 누르고 클릭) → 열기**를 선택하면 한 번만
+> 확인하고 넘어갈 수 있습니다. 서명 안 된 스크립트에 macOS Gatekeeper가 붙이는 격리
+> 속성 때문이며, Windows의 SmartScreen 경고와 같은 종류입니다 — 실제 위험이 있다는
+> 뜻은 아닙니다.
+
+이후 사용법은 Windows와 동일합니다 (아래 [화면 둘러보기](#화면-둘러보기) 참고).
+
+가장 간단하게는 위 [웹에서 바로 실행](#웹에서-바로-실행) 링크를 Chrome/Edge로 열어도
+됩니다 — 이 경우 `run.command`조차 필요 없습니다.
+
+---
+
 ## 개발자용 빠른 시작
 
 **1. 준비물** — Chrome 또는 Edge, 그리고 Python.
